@@ -1,0 +1,4 @@
+# Python-specific ignores
+__pycache__/
+*.pyc
+.DS_Store
