@@ -3,7 +3,7 @@ from __future__ import annotations
 import pandas as pd
 import numpy as np
 
-def cumulative_pips_series(trades: pd.DataFrame, index: pd.DatetimeIndex, when: str = "exit") -> pd.Series:
+def cumulative_pips(trades: pd.DataFrame, index: pd.DatetimeIndex, when: str = "exit") -> pd.Series:
     """
     Build a per-bar cumulative pips series from a trade ledger.
     - 'when' is 'exit' or 'entry' to choose when to book the pips.

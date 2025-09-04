@@ -4,7 +4,7 @@ interfaces.py — pips-only strategy output interface (LLM/ML ready)
 Usage:
   from interfaces import (
       StrategyRunMeta, StrategyRunPayload, validate_trades,
-      build_pips_brief, normalize_side, REQUIRED_TRADE_COLS, OPTIONAL_TRADE_COLS,
+      normalize_side, REQUIRED_TRADE_COLS, OPTIONAL_TRADE_COLS,
       StrategyResultProvider
   )
 
@@ -15,7 +15,6 @@ Design:
   - Validators + side normalization
   - Brief builder for LLM/ML (JSON-ready)
 """
-
 from __future__ import annotations
 from dataclasses import dataclass, asdict
 from typing import Dict, Any, List, Literal, Optional, Protocol
@@ -117,7 +116,5 @@ __all__ = [
     "OPTIONAL_TRADE_COLS",
     "validate_trades",
     "normalize_side",
-    "cumulative_pips_series",
-    "build_pips_brief",
     "StrategyResultProvider",
 ]

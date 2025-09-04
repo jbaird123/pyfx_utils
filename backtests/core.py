@@ -1,4 +1,3 @@
-# /MyDrive/code/pyfx_utils/backtests/core.py
 import numpy as np
 import pandas as pd
 from typing import Protocol,Optional

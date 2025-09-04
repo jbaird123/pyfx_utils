@@ -1,15 +1,16 @@
-# pyfx_utils/analysis/augment.py
 from __future__ import annotations
-from typing import Any, Dict, Sequence, Type, Optional
-
-from ..backtests.core import backtest
-from .interfaces import cumulative_pips_series
-from .perf import perf_by_regime_pips  
 import inspect
 import math
 import pandas as pd
 
-# Canonical imports from your package
+from typing import Any, Dict, Sequence, Type, Optional
+
+from ..backtests.signal import BTConfig
+from ..backtests.core import backtest
+from ..utils.stats import cumulative_pips
+from .regime import perf_by_regime, perf_by_regime_pips, build_regime_features, kmeans_regimes
+
+# Canonical imports 
 from .tuning import (
     grid_search,
     random_search,
@@ -20,11 +21,6 @@ from .tuning import (
     obj_total_pips,
     _py_scalar
 )
-from .perf import trade_pnls, perf_by_regime
-from .regime import build_regime_features, kmeans_regimes
-from ..backtests.core import backtest
-from ..backtests.signal import BTConfig
-
 
 def adf_test(series: pd.Series, autolag: str = "AIC") -> Dict[str, Any]:
     """

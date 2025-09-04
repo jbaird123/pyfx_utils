@@ -1,3 +1,10 @@
+from __future__ import annotations
+from typing import Dict
+import numpy as np
+import pandas as pd
+
+from ..utils.time import infer_bars_per_year
+
 def metrics(pnl: pd.Series, index: pd.DatetimeIndex) -> Dict[str, float]:
     pnl = pnl.fillna(0.0).astype(float)
     bpy = infer_bars_per_year(index)

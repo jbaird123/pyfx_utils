@@ -34,6 +34,7 @@ def _equity_from_signal(px: pd.Series, sig: pd.Series, fee_bps: float, slippage_
     Returns DataFrame[ret(eq bar pnl), eq, sig]
     """
     px = px.astype(float)
+    sig = sig.astype(float)
     ret = px.pct_change().fillna(0.0)
     gross = sig * ret
     turns = _turnover(sig)

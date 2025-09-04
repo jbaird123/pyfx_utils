@@ -1,3 +1,8 @@
+from .backtests.signal import BTConfig, backtest_signal, equity_curve_from_signal, equity_curve_from_trades
+from .backtests.metrics import metrics, metrics_by_period
 
-# pyfx_utils — lightweight, modular helpers for FX research
-__all__ = ["viz", "indicators", "utils"]
+__all__ = [
+    "BTConfig", "backtest_signal", "equity_curve_from_signal", "equity_curve_from_trades",
+    "metrics", "metrics_by_period",
+    "viz", "indicators", "utils",
+]
