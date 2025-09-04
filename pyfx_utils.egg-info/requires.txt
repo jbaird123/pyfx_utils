@@ -1,0 +1,14 @@
+pandas>=1.5
+numpy>=1.23
+
+[analysis]
+scikit-learn>=1.2
+statsmodels>=0.14
+
+[dev]
+pytest>=8.0
+hypothesis>=6.0
+
+[viz]
+matplotlib>=3.7
+plotly>=5.15

@@ -76,7 +76,8 @@ def test_equity_from_signal_math_no_costs():
     # ret column stores pnl-per-bar
     np.testing.assert_allclose(got["ret"].values, pnl, rtol=1e-12, atol=1e-12)
     np.testing.assert_allclose(got["eq"].values, eq, rtol=1e-12, atol=1e-12)
-    pd.testing.assert_series_equal(got["sig"], sig)
+    pd.testing.assert_series_equal(got["sig"], sig.rename("sig"))
+
 
 def test_equity_from_signal_applies_costs_on_turnover_only():
     prices = [100, 101, 102, 103]

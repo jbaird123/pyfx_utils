@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyfx_utils"
+version = "0.0.1"
+description = "FX research utilities"
+requires-python = ">=3.9"
+dependencies = [
+  "pandas>=1.5",
+  "numpy>=1.23",
+]
+
+[project.optional-dependencies]
+viz = ["matplotlib>=3.7", "plotly>=5.15"]
+analysis = ["scikit-learn>=1.2", "statsmodels>=0.14"]
+dev = ["pytest>=8.0", "hypothesis>=6.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pyfx_utils*"]
+exclude = ["tests*", "docs*"]

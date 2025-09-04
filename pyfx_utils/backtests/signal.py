@@ -20,8 +20,13 @@ def _prep_signal(signal: pd.Series, lag: int) -> pd.Series:
     return signal.shift(lag).fillna(0.0)
 
 def _turnover(sig: pd.Series) -> pd.Series:
-    """1 on bars where position changes, else 0."""
-    return (sig != sig.shift()).astype(int).fillna(0)
+    """
+    1 on bars where position changes compared to the *previous* bar, else 0.
+    Never counts the first bar as turnover.
+    """
+    prev = sig.shift()
+    changed = sig.ne(prev) & prev.notna()   # ensure first bar is False
+    return changed.astype(int)
 
 def _equity_from_signal(px: pd.Series, sig: pd.Series, fee_bps: float, slippage_bps: float) -> pd.DataFrame:
     """
