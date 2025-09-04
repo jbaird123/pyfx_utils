@@ -26,3 +26,17 @@ def snap_to_bars(ts: pd.Series, bar_index: pd.DatetimeIndex, tolerance="18h") ->
     )
     merged.index = s.index
     return merged["bar_time"]
+
+def infer_bars_per_year(index: pd.DatetimeIndex) -> int:
+    if len(index) < 2:
+        return 252
+    dt = (index[1] - index[0]).total_seconds()
+    if dt <= 60:      # 1-min
+        return int(252 * 6.5 * 60)
+    if dt <= 300:     # 5-min
+        return int(252 * 6.5 * 12)
+    if dt <= 3600:    # 1-hour
+        return int(252 * 6.5)
+    if dt <= 86400:   # daily
+        return 252
+    return 252

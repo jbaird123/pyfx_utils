@@ -204,3 +204,21 @@ def backtest(data: pd.DataFrame, strategy: StrategyProtocol, pip: float) -> pd.D
                 tp_px   = _fixed_price_from_dist(state, ep, dist_tp,   is_stop=False) if not np.isnan(dist_tp)   else np.nan
 
     return pd.DataFrame(out, columns=["side","entry_time","entry_price","exit_time","exit_price","pips"])
+
+def trade_pnls(pnl: pd.Series, sig: pd.Series) -> list[float]:
+    tp = []
+    run = 0.0
+    had_pos = False
+    for r, s in zip(pnl.values, sig.values):
+        if s != 0:
+            run += r
+            had_pos = True
+        else:
+            if had_pos:
+                tp.append(run)
+                run = 0.0
+                had_pos = False
+    if had_pos:
+        tp.append(run)
+    return tp
+

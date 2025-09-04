@@ -52,3 +52,86 @@ def perf_by_regime(ret_pips: pd.Series, regimes: pd.Series) -> pd.DataFrame:
         'n_bars': grp.size(),
     }).sort_index()
 
+def perf_by_regime(pnl: pd.Series, labels: pd.Series) -> pd.DataFrame:
+    """
+    Compute performance metrics grouped by regime labels.
+
+    Parameters
+    ----------
+    pnl : pd.Series
+        Per-bar returns (e.g. pct changes or strategy returns).
+        Index should be aligned with labels.
+    labels : pd.Series
+        Cluster/regime labels (e.g. from kmeans_regimes).
+        Index should align with pnl.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per regime with:
+        - regime (label value)
+        - bars (# of samples)
+        - total_return ((1+ret).prod()-1)
+        - mean (average per-bar return)
+        - std (stdev per-bar return)
+        - sharpe_like (mean/std, unannualized)
+    """
+    s = pd.Series(pnl).dropna()
+    labs = pd.Series(labels).reindex(s.index).dropna()
+    s = s.reindex(labs.index)
+
+    rows = []
+    for k, grp in s.groupby(labs):
+        rr = (1.0 + grp).prod() - 1.0
+        mu = grp.mean()
+        sd = grp.std(ddof=0)
+        sharpe = mu / (sd + 1e-12)
+        rows.append({
+            "regime": k,
+            "bars": int(grp.size),
+            "total_return": float(rr),
+            "mean": float(mu),
+            "std": float(sd),
+            "sharpe_like": float(sharpe),
+        })
+
+    return pd.DataFrame(rows).sort_values("total_return", ascending=False).reset_index(drop=True)
+
+def perf_by_regime_pips(pips_per_bar: pd.Series, labels: pd.Series) -> pd.DataFrame:
+    """
+    Group performance by regime, using *pips per bar* (additive) rather than multiplicative returns.
+    Returns a table with total/mean/std pips per regime.
+
+    Parameters
+    ----------
+    pips_per_bar : pd.Series (float)
+        Per-bar pips increments (e.g., diff of a cumulative pips curve).
+    labels : pd.Series
+        Regime labels indexed by the same DatetimeIndex.
+
+    Returns
+    -------
+    pd.DataFrame with columns:
+      - regime
+      - bars
+      - total_pips
+      - mean_pips
+      - std_pips
+    """
+    s = pd.Series(pips_per_bar).astype(float)
+    labs = pd.Series(labels).reindex(s.index)
+
+    mask = labs.notna()
+    s = s[mask]
+    labs = labs[mask]
+
+    rows = []
+    for reg, grp in s.groupby(labs):
+        rows.append({
+            "regime": reg,
+            "bars": int(grp.size),
+            "total_pips": float(grp.sum()),
+            "mean_pips": float(grp.mean()),
+            "std_pips": float(grp.std(ddof=0)),
+        })
+    return pd.DataFrame(rows).sort_values("total_pips", ascending=False).reset_index(drop=True)

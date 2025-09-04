@@ -3,21 +3,20 @@ from __future__ import annotations
 import pandas as pd
 import numpy as np
 
-def cumulative_pips(trades: pd.DataFrame, index: pd.Index, when: str = "exit") -> pd.Series:
+def cumulative_pips_series(trades: pd.DataFrame, index: pd.DatetimeIndex, when: str = "exit") -> pd.Series:
     """
-    Build a per-bar cumulative pips series, aligned to `index`.
-    We 'book' each trade's pips on a single bar (entry or exit), then cumsum.
+    Build a per-bar cumulative pips series from a trade ledger.
+    - 'when' is 'exit' or 'entry' to choose when to book the pips.
     """
-    if trades is None or len(trades) == 0:
-        return pd.Series(0.0, index=index, dtype="float64")
-
     assert when in ("exit", "entry")
     tcol = f"{when}_time"
-
+    pips_per_bar = pd.Series(0.0, index=index, dtype="float64")
+    if trades.empty:
+        return pips_per_bar
     increments = trades.groupby(tcol)["pips"].sum()
     increments = increments.reindex(index, fill_value=0.0)
-
     return increments.cumsum()
+
 
 
 def trades_summary(trades: pd.DataFrame) -> dict:
