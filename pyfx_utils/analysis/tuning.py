@@ -397,7 +397,6 @@ def _expand_param_grid(param_grid: Dict[str, Iterable[Any]]) -> List[Dict[str, A
 
     Any other keys are treated as independent dimensions.
     """
-    import math
     # Helper to build valid pairs for a group if present
     def group_pairs(prefix: str) -> Optional[List[Dict[str, Any]]]:
         tkey, vkey = f"{prefix}_type", f"{prefix}_value"
@@ -553,7 +552,6 @@ def run_param_search(
             return False
 
         # If type is set, value must be a real number (not None/NaN)
-        import math
         if p.get("stop_type") is not None:
             v = p.get("stop_value")
             if v is None or (isinstance(v, float) and math.isnan(v)):
@@ -656,18 +654,36 @@ def run_param_search(
     df = pd.DataFrame(recs)
     param_cols = [c for c in df.columns if c.startswith("param_")]
 
-    def _is_real_nan(x):
-        return isinstance(x, float) and math.isnan(x)
+    # 1) Normalize: force object dtype and convert float NaN -> None
+    def _nan_to_none(x):
+        return None if (isinstance(x, float) and math.isnan(x)) else x
 
-    nan_mask = df[param_cols].applymap(_is_real_nan)
-    if not df.empty and nan_mask.any().any():
-        bad = [c for c in param_cols if nan_mask[c].any()]
+    for c in param_cols:
+        # column-wise map avoids the applymap deprecation warning
+        df[c] = df[c].map(_nan_to_none)
+
+    # 2) Strict validity check on paired params:
+    #    If *_type is not None, then *_value must not be None.
+    def _bad_pair(row, prefix: str) -> bool:
+        t = row.get(f"param_{prefix}_type", None)
+        v = row.get(f"param_{prefix}_value", None)
+        return (t is not None) and (v is None)
+
+    bad_mask = df.apply(
+        lambda r: _bad_pair(r, "stop") or _bad_pair(r, "tp") or _bad_pair(r, "trail"),
+        axis=1
+    )
+
+    if not df.empty and bad_mask.any():
+        offenders = df.loc[
+            bad_mask,
+            [c for c in df.columns if c.startswith("param_")] + ["n_trades","total_pips","mean_pips","max_dd_pips","win_rate"]
+        ].head(8).to_dict(orient="records")
         raise RuntimeError(
-            f"Param columns contain NaN after evaluation: {bad}. "
-            "Likely a type/value mismatch or Pandas coercion from mixed dtypes. "
-            "Ensure that when *_type is not None, the paired *_value is numeric; "
-            "and when *_type is None, the paired *_value is None."
+            "Invalid parameter rows: *_type is set but *_value is None. "
+            f"Examples (truncated): {offenders}"
         )
+
 
 
     # --- STRICT RESULT CHECK: no duplicate *effective* params allowed
