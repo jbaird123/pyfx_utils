@@ -107,22 +107,6 @@ def mc_summary(paths: np.ndarray) -> Dict[str, float]:
         'mdd05': float(dd.min()),
     }
 
-# --- FX pip helpers (moved from notebook) ------------------------------------
-
-def infer_pip_size(symbol: str) -> float:
-    """
-    Very lightweight heuristic:
-    - JPY pairs (e.g., 'USDJPY', 'EUR/JPY') use 0.01
-    - Everything else defaults to 0.0001
-
-    Notes
-    -----
-    - This is intentionally simple; if you maintain contract specs elsewhere,
-      consider wiring that in and making this a table lookup instead.
-    """
-    return 0.01 if "JPY" in symbol.replace("/", "") else 0.0001
-
-
 def compute_pips(df: pd.DataFrame, symbol: str) -> pd.Series:
     """
     Compute pips for a trades DataFrame using entry/exit price and side.
@@ -154,3 +138,16 @@ def compute_pips(df: pd.DataFrame, symbol: str) -> pd.Series:
     sign = df["side"].map(side_sign)
     raw = (df["exit_price"] - df["entry_price"]) / pip
     return sign * raw
+def infer_pip_size(symbol: str) -> float:
+    """
+    Very lightweight heuristic:
+    - JPY pairs (e.g., 'USDJPY', 'EUR/JPY') use 0.01
+    - Everything else defaults to 0.0001
+
+    Notes
+    -----
+    - This is intentionally simple; if you maintain contract specs elsewhere,
+      consider wiring that in and making this a table lookup instead.
+    """
+    return 0.01 if "JPY" in symbol.replace("/", "") else 0.0001
+

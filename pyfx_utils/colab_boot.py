@@ -1,21 +1,30 @@
 # pyfx_utils/colab_boot.py
 def boot(code_dir="/content/drive/MyDrive/fx/code", ensure=("lightweight-charts",)):
     import os, sys, importlib, subprocess
+
+    # 1) Mount Drive (in Colab)
     try:
         from google.colab import drive
         if not os.path.ismount("/content/drive"):
             drive.mount("/content/drive")
     except Exception:
         pass
+
+    # 2) Put your code dir on path
     if code_dir not in sys.path:
         sys.path.insert(0, code_dir)
+
+    # 3) Hot-reload pyfx_utils
     for m in list(sys.modules):
         if m.startswith("pyfx_utils"):
             del sys.modules[m]
     importlib.invalidate_caches()
+
+    # 3b) Ensure optional deps are present
     for p in ensure or ():
         mod = p.replace("-", "_")
-        try: __import__(mod)
+        try:
+            __import__(mod)
         except Exception:
             subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", p])
 
@@ -27,7 +36,10 @@ def boot(code_dir="/content/drive/MyDrive/fx/code", ensure=("lightweight-charts"
     )
     # indicators
     from pyfx_utils.indicators import add_indicators
-    from pyfx_utils.utils import load_fx_csv, resample , pip_factor
+
+    # utils
+    from pyfx_utils.utils import load_fx_csv, resample
+    from pyfx_utils.utils.stats import infer_pip_size, compute_pips  
 
     # analysis
     from pyfx_utils.analysis import (
@@ -35,9 +47,10 @@ def boot(code_dir="/content/drive/MyDrive/fx/code", ensure=("lightweight-charts"
         trade_pnls, metrics_by_period,
         annotate_trades_with_indicators, walk_forward_ranges
     )
-    
+
     # backtests (signal vector backtester, optional)
     from pyfx_utils.backtests import BTConfig, backtest_signal
+
 
     # 5) Return a namespace dict that %pyfx_boot will inject into globals()
     return dict(
@@ -47,7 +60,8 @@ def boot(code_dir="/content/drive/MyDrive/fx/code", ensure=("lightweight-charts"
         # indicators
         add_indicators=add_indicators,
         # utils
-        load_fx_csv=load_fx_csv, resample=resample, pip_factor=pip_factor,
+        load_fx_csv=load_fx_csv, resample=resample,
+        infer_pip_size=infer_pip_size, compute_pips=compute_pips,
         # analysis
         equity_curve_from_trades=equity_curve_from_trades,
         equity_curve_from_signal=equity_curve_from_signal,

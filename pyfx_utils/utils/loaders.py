@@ -37,14 +37,8 @@ def resample(df: pd.DataFrame, rule: str = "1D",
     out = df.resample(rule, label=label, closed=closed).agg(agg)
     return out.dropna(subset=["open","high","low","close","volume"])
 
-def pip_factor(instrument: str) -> float:
-    """
-    Simple inference:
-      - JPY quotes ~ 0.01 pip (e.g., USD/JPY)
-      - Otherwise ~ 0.0001 (e.g., EUR/USD)
-    """
-    inst = instrument.replace(" ", "").upper()
-    return 0.01 if "JPY" in inst else 0.0001
+
+# --- FX pip helpers (moved from notebook) ------------------------------------
 
 def generate_quality_report(df: pd.DataFrame) -> Dict[str, Any]:
     report = {}
