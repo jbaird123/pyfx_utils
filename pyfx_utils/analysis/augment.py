@@ -3,6 +3,7 @@ import inspect
 import math
 import pandas as pd
 import numpy as np
+import datetime as dt
 
 from typing import Any, Dict, Sequence, Type, Optional
 from dataclasses import asdict
@@ -236,22 +237,58 @@ def _nan_to_none(x):
 
 
 
+def _to_jsonable(x):
+    # None and plain strings pass through
+    if x is None or isinstance(x, str):
+        return x
+
+    # Pandas datetime-like
+    if isinstance(x, pd.Timestamp):
+        return x.isoformat()
+    if isinstance(x, pd.Timedelta):
+        # choose a stable scalar; seconds works well for briefs
+        return float(x.total_seconds())
+
+    # Python datetime/date
+    if isinstance(x, dt.datetime):
+        return x.isoformat()
+    if isinstance(x, dt.date):
+        return x.isoformat()
+
+    # NumPy scalars
+    if isinstance(x, np.integer):
+        return int(x)
+    if isinstance(x, np.floating):
+        f = float(x)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
+
+    # Plain floats/ints
+    if isinstance(x, float):
+        if math.isnan(x) or math.isinf(x):
+            return None
+        return x
+    if isinstance(x, int) or isinstance(x, bool):
+        return x
+
+    # Containers: recurse
+    if isinstance(x, dict):
+        return {str(k): _to_jsonable(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_to_jsonable(v) for v in x]
+    if isinstance(x, (pd.Series, pd.Index, np.ndarray)):
+        return [_to_jsonable(v) for v in list(x)]
+
+    # Fallback: let json handle (or stringify if you prefer)
+    return x
+
 def _jsonify(obj):
-    # Dict
-    if isinstance(obj, dict):
-        return {k: _jsonify(_nan_to_none(v)) for k, v in obj.items()}
-    # List/Tuple
-    if isinstance(obj, (list, tuple)):
-        return [ _jsonify(_nan_to_none(v)) for v in obj ]
-    # Numpy scalars → Python
-    try:
-        import numpy as np
-        if isinstance(obj, (np.generic,)):
-            obj = obj.item()
-    except Exception:
-        pass
-    # Final scalar pass
-    return _nan_to_none(obj)
+    """
+    Convert an arbitrary structure (dict/list/scalars) into JSON-serializable
+    Python objects, normalizing NaN/NaT/inf and pandas/numpy types.
+    """
+    return _to_jsonable(obj)
 
 
 def _round_value_for_brief(key, val):
