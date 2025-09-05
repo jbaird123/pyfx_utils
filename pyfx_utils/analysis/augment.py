@@ -243,6 +243,77 @@ def _jsonify(obj):
         return [_jsonify(v) for v in obj]
     return obj
 
+def _round_value_for_brief(key: str, val):
+    """
+    Rounding policy for the brief:
+      - Any key containing 'pips' -> int
+      - 'win_rate' -> 3 decimals (fraction 0..1)
+      - coverage ratios (keys ending with 'coverage') -> 3 decimals
+      - feature snapshot values like 'rsi@entry', 'adx@entry', 'bb_width@entry', 'atr_pips@entry':
+          * if key contains 'atr_pips' -> int (pips)
+          * else -> round to 2 decimals
+      - 'seconds_median' -> int, 'days_median' -> 2 decimals
+      - Monte Carlo fields (p05, p50, p95, exp, mdd05, p??_mdd) -> int (they’re pips)
+      - Leave timestamps/strings/None untouched
+    """
+    import math
+    if val is None:
+        return None
+    if isinstance(val, (str, pd.Timestamp, pd.Timedelta)):
+        return val
+
+    # pips anywhere
+    if "pips" in key:
+        return int(round(float(val)))
+
+    # rates/coverage
+    if key == "win_rate":
+        return round(float(val), 3)
+    if key.endswith("coverage"):
+        return round(float(val), 3)
+
+    # holding period
+    if key == "seconds_median":
+        return int(round(float(val)))
+    if key == "days_median":
+        return round(float(val), 2)
+
+    # monte carlo pips-like keys
+    if key in {"p05","p50","p95","exp","mdd05","p05_mdd","p50_mdd","p95_mdd"}:
+        return int(round(float(val)))
+
+    # feature snapshots
+    if "@entry" in key or "@exit" in key:
+        if "atr_pips" in key:
+            return int(round(float(val)))
+        return round(float(val), 2)
+
+    # default: if numeric and finite, round to 3 decimals to keep things tidy
+    try:
+        f = float(val)
+        if math.isfinite(f):
+            return round(f, 3)
+    except Exception:
+        pass
+    return val
+
+
+def _round_structure_for_brief(obj):
+    """Walk the brief (dict/list/scalars) and apply _round_value_for_brief by key."""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if isinstance(v, (dict, list)):
+                out[k] = _round_structure_for_brief(v)
+            else:
+                out[k] = _round_value_for_brief(k, v)
+        return out
+    elif isinstance(obj, list):
+        return [_round_structure_for_brief(x) for x in obj]
+    else:
+        return obj
+
+
 def build_pips_brief(payload: StrategyRunPayload) -> Dict[str, Any]:
     """
     Create a compact, JSON-ready brief for LLM/ML consumption. Pips-only.
@@ -408,7 +479,9 @@ def build_pips_brief(payload: StrategyRunPayload) -> Dict[str, Any]:
     except Exception:
         pass
     
-    return _jsonify(brief)
+    brief_rounded = _round_structure_for_brief(brief)
+    return _jsonify(brief_rounded)
+
 
 
 def annotate_trades(

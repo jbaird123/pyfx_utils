@@ -26,6 +26,25 @@ def _py_scalar(v):
     # strings or other objects pass through
     return v
 
+def _round_metrics_for_tuning(m: Dict[str, float]) -> Dict[str, float]:
+    """
+    Rounding policy for tuning outputs:
+      - pips metrics -> whole numbers
+      - win_rate     -> 3 decimals (fraction 0..1)
+      - n_trades     -> int
+    """
+    out = dict(m)
+    # pips-like fields
+    for k in ("total_pips", "mean_pips", "median_pips", "max_dd_pips"):
+        if k in out and out[k] is not None:
+            out[k] = int(round(float(out[k])))
+    # win rate as fraction, 3 decimals
+    if "win_rate" in out and out["win_rate"] is not None:
+        out["win_rate"] = round(float(out["win_rate"]), 3)
+    # n_trades int (already int, but be safe)
+    if "n_trades" in out and out["n_trades"] is not None:
+        out["n_trades"] = int(out["n_trades"])
+    return out
 
 # ---------- Types ----------
 ObjectiveFn = Callable[[pd.DataFrame, pd.Index], float]  # (trades, index) -> score
@@ -504,10 +523,11 @@ def run_param_search(
             # Basic checks
             if trades is None or not isinstance(trades, pd.DataFrame) or "pips" not in trades.columns:
                 # Treat as zero-result
-                metrics = {
+                metrics = _round_metrics_for_tuning({
                     "n_trades": 0, "total_pips": 0.0, "mean_pips": 0.0,
                     "median_pips": 0.0, "max_dd_pips": 0.0, "win_rate": 0.0
-                }
+                })
+
                 rows.append(ParamSearchResult(params=params, metrics=metrics, n_trades=0))
                 continue
 
@@ -528,22 +548,24 @@ def run_param_search(
             wins = (t["pips"] > 0)
             win_rate = float(wins.mean()) if n_tr else 0.0
 
-            metrics = {
+            metrics = _round_metrics_for_tuning({
                 "n_trades": n_tr,
                 "total_pips": total,
                 "mean_pips": mean_,
                 "median_pips": median_,
                 "max_dd_pips": mdd,
                 "win_rate": win_rate,
-            }
+            })
+
 
             rows.append(ParamSearchResult(params=params, metrics=metrics, n_trades=n_tr))
         except Exception:
             # Fail-soft: count as a zero row; keep search robust
-            metrics = {
+            metrics = _round_metrics_for_tuning({
                 "n_trades": 0, "total_pips": 0.0, "mean_pips": 0.0,
                 "median_pips": 0.0, "max_dd_pips": 0.0, "win_rate": 0.0
-            }
+            })
+
             rows.append(ParamSearchResult(params=params, metrics=metrics, n_trades=0))
 
     # Build a DataFrame to sort and select top rows
