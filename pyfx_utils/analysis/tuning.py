@@ -331,6 +331,8 @@ def sanitize_tuning_block(tuning: dict) -> dict:
                 r["param_stop_value"] = None
             if r.get("param_tp_type") is None:
                 r["param_tp_value"] = None
+            if r.get("param_trail_type") is None:
+                r["param_trail_value"] = None
             fixed.append(r)
         out["top"] = fixed
 
@@ -342,6 +344,8 @@ def sanitize_tuning_block(tuning: dict) -> dict:
             bp["stop_value"] = None
         if bp.get("tp_type") is None:
             bp["tp_value"] = None
+        if bp.get("trail_type") is None:
+            bp["trail_value"] = None
         out["best_params"] = bp
 
     return out
@@ -459,6 +463,37 @@ def run_param_search(
         if key not in seen:
             seen.add(key)
             combos.append(eff)
+    def _is_valid_combo(p: dict) -> bool:
+        # If type is None, paired value must be None
+        if p.get("stop_type") is None and p.get("stop_value") is not None:
+            return False
+        if p.get("tp_type") is None and p.get("tp_value") is not None:
+            return False
+        if p.get("trail_type") is None and p.get("trail_value") is not None:
+            return False
+
+        # If type is set, value must be a real number (not None/NaN)
+        import math
+        if p.get("stop_type") is not None:
+            v = p.get("stop_value")
+            if v is None or (isinstance(v, float) and math.isnan(v)):
+                return False
+        if p.get("tp_type") is not None:
+            v = p.get("tp_value")
+            if v is None or (isinstance(v, float) and math.isnan(v)):
+                return False
+        if p.get("trail_type") is not None:
+            v = p.get("trail_value")
+            if v is None or (isinstance(v, float) and math.isnan(v)):
+                return False
+        return True
+
+    invalid = [p for p in combos if not _is_valid_combo(p)]
+    if invalid:
+        raise RuntimeError(
+            "Invalid parameter combinations in grid (type/value mismatch). "
+            "First few examples: " + repr(invalid[:5])
+        )
 
     rows: List[ParamSearchResult] = []
 
@@ -534,6 +569,16 @@ def run_param_search(
         return sanitize_tuning_block(tuning)
 
     df = pd.DataFrame(recs)
+    param_cols = [c for c in df.columns if c.startswith("param_")]
+    if not df.empty and df[param_cols].isnull().any().any():
+        bad = [c for c in param_cols if df[c].isnull().any()]
+        raise RuntimeError(
+            f"Param columns contain NaN after evaluation: {bad}. "
+            "Likely a type/value mismatch or Pandas coercion from mixed dtypes. "
+            "Ensure that when *_type is not None, the paired *_value is numeric; "
+            "and when *_type is None, the paired *_value is None."
+        )
+
     # --- STRICT RESULT CHECK: no duplicate *effective* params allowed
     def _effective_key_from_row(row: pd.Series):
         eff = {k.replace("param_", ""): row[k] for k in row.index if k.startswith("param_")}
