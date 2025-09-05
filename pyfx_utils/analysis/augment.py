@@ -272,12 +272,6 @@ def _round_value_for_brief(key, val):
         return val
 
     # --- Helpers
-    def _is_number(x):
-        try:
-            f = float(x)
-            return math.isfinite(f)
-        except Exception:
-            return False
 
     def _is_ratio_key(s: str) -> bool:
         s = s.lower()
@@ -521,7 +515,9 @@ def build_pips_brief(payload: StrategyRunPayload) -> Dict[str, Any]:
             brief["overall_pips"]["by_side_total_pips"] = bs_fixed
     
     brief_rounded = _round_structure_for_brief(brief)
-    return _jsonify(brief_rounded)
+    brief_coerced = _coerce_tree(brief_rounded)  # <-- must be here, after rounding
+    return _jsonify(brief_coerced)
+
 
 
 
@@ -693,19 +689,17 @@ def _is_number(x):
     except Exception:
         return False
 
-# Keys that should be ints if numeric & integral
+# Keys that should be ints if numeric & integral (outside params)
 _INT_KEYS_EXACT = {
     "n_trades", "seconds_median", "bars", "year",
     "n_sims", "horizon", "n_long", "n_short",
     "total_pips", "max_dd_pips", "mdd05",
 }
 
-# Param names that should be ints if integral
-_PARAM_INTLIKE = {"fast", "slow", "atr_length"}
-
-def _coerce_scalar_type(key: str, val):
+def _coerce_scalar_type(key: str, val, *, in_params: bool):
     """
     Snap types after rounding: ints where expected, booleans restored.
+    `in_params` indicates we're inside the 'params' dict.
     """
     k = str(key)
 
@@ -719,30 +713,36 @@ def _coerce_scalar_type(key: str, val):
 
     # Restore booleans that may have become 0/1 numerically
     if k.endswith("applied") and _is_number(val):
-        f = float(val)
-        return bool(int(round(f)))
+        return bool(int(round(float(val))))
 
-    # Explicit int fields
+    # Inside params: coerce any integral numeric to int
+    if in_params and _is_number(val):
+        f = float(val)
+        if f.is_integer():
+            return int(f)
+        return f  # leave non-integral as float
+
+    # Outside params: explicit int fields
     if k in _INT_KEYS_EXACT and _is_number(val):
         f = float(val)
         return int(round(f))
 
-    # Params that are int-like
-    if (k.startswith("param_") and k.replace("param_", "") in _PARAM_INTLIKE) or (k in _PARAM_INTLIKE):
-        if _is_number(val):
-            f = float(val)
-            if f.is_integer():
-                return int(f)
-
     return val
 
-def _coerce_tree(obj, parent_key=None):
+def _coerce_tree(obj, *, in_params: bool = False):
+    """
+    Walks the structure; when entering the 'params' dict, sets in_params=True
+    so param values get int-coerced if integral.
+    """
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
-            out[k] = _coerce_tree(v, k)
+            child_in_params = in_params or (k == "params")
+            out[k] = _coerce_tree(v, in_params=child_in_params)
         return out
     elif isinstance(obj, list):
-        return [_coerce_tree(v, parent_key) for v in obj]
+        return [_coerce_tree(v, in_params=in_params) for v in obj]
     else:
-        return _coerce_scalar_type(parent_key or "", obj)
+        # Leaf scalar
+        parent_key = ""  # we only need the immediate key at the dict level; for leaves we don’t have it
+        return _coerce_scalar_type(parent_key, obj, in_params=in_params)
