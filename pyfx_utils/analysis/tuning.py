@@ -630,16 +630,18 @@ def run_param_search(
             rows.append(ParamSearchResult(params=params, metrics=metrics, n_trades=0))
 
     # Build a DataFrame to sort and select top rows
+    # Ensure all rows have the same param_* columns (fill missing with None)
+    all_param_keys = sorted({k for r in rows for k in r.params.keys()})
+
     recs = []
     for r in rows:
         rec: Dict[str, Any] = {}
-        # Flatten params into "param_*" columns, mirroring sklearn style
-        for k, v in r.params.items():
-            rec[f"param_{k}"] = v
+        for k in all_param_keys:
+            rec[f"param_{k}"] = r.params.get(k, None)
         rec.update(r.metrics)
-        # Optional derived score (not kept unless include_extra_cols=True)
         rec["_score"] = score_fn(r.metrics)
         recs.append(rec)
+
 
     if len(recs) == 0:
         tuning = {
@@ -653,14 +655,20 @@ def run_param_search(
 
     df = pd.DataFrame(recs)
     param_cols = [c for c in df.columns if c.startswith("param_")]
-    if not df.empty and df[param_cols].isnull().any().any():
-        bad = [c for c in param_cols if df[c].isnull().any()]
+
+    def _is_real_nan(x):
+        return isinstance(x, float) and math.isnan(x)
+
+    nan_mask = df[param_cols].applymap(_is_real_nan)
+    if not df.empty and nan_mask.any().any():
+        bad = [c for c in param_cols if nan_mask[c].any()]
         raise RuntimeError(
             f"Param columns contain NaN after evaluation: {bad}. "
             "Likely a type/value mismatch or Pandas coercion from mixed dtypes. "
             "Ensure that when *_type is not None, the paired *_value is numeric; "
             "and when *_type is None, the paired *_value is None."
         )
+
 
     # --- STRICT RESULT CHECK: no duplicate *effective* params allowed
     def _effective_key_from_row(row: pd.Series):
