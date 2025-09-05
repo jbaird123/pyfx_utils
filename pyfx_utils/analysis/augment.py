@@ -287,6 +287,10 @@ def _round_value_for_brief(key, val):
     if "pips" in k:
         return int(round(f))
 
+    # Treat these risk fields as pips too -> int
+    if k in {"avg_win","avg_loss","max_win","max_loss"}:
+        return int(round(float(val)))
+
     # rates/coverage
     if k == "win_rate":
         return round(f, 3)
@@ -723,6 +727,10 @@ def _coerce_scalar_type(key: str, val, *, in_params: bool, parent_key: str | Non
     
     # Side totals: force ints (you want whole pips)
     if parent_key == "by_side_total_pips" and _is_number(val):
+        return int(round(float(val)))
+
+    # Risk snapshot pip metrics -> whole pips
+    if k in {"avg_win", "avg_loss", "max_win", "max_loss"} and _is_number(val):
         return int(round(float(val)))
 
     # Known int keys elsewhere
