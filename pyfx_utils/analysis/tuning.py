@@ -6,6 +6,7 @@ import random
 import pandas as pd
 import numpy as np
 import os
+import math
 from datetime import datetime
 
 from pyfx_utils.backtests.core import backtest
@@ -391,6 +392,7 @@ def run_param_search(
     # A callable that, given (data, params), returns a trades DataFrame
     # with at least a float "pips" column; times optional but helpful.
     strategy_runner: Callable[[pd.DataFrame, Dict[str, Any]], pd.DataFrame],
+    strict: bool = True,  #fails loudly if there are duplicates present.
     # Dict[str, Iterable] just like sklearn's GridSearchCV param_grid
     param_grid: Dict[str, Iterable[Any]],
     # Optional scoring function that maps the per-combo metrics -> sortable key
@@ -432,7 +434,31 @@ def run_param_search(
         (Sanitized so *_value is None when *_type is None.)
     """
     score_fn = score_fn or _default_score
-    combos = _expand_param_grid(param_grid)
+
+    # --- Expand raw Cartesian grid
+    combos_raw = _expand_param_grid(param_grid)
+
+    # --- Canonicalize & DEDUPE BEFORE evaluation (avoid functional duplicates)
+    def _canonicalize_params_for_effect(p: dict) -> dict:
+        q = dict(p)
+        if q.get("stop_type")  is None: q["stop_value"]  = None
+        if q.get("tp_type")    is None: q["tp_value"]    = None
+        if q.get("trail_type") is None: q["trail_value"] = None
+        return q
+
+    def _hashable_key(d: dict):
+        def _norm(v):
+            return None if (isinstance(v, float) and math.isnan(v)) else v
+        return tuple(sorted((k, _norm(v)) for k, v in d.items()))
+
+    seen = set()
+    combos: List[Dict[str, Any]] = []
+    for p in combos_raw:
+        eff = _canonicalize_params_for_effect(p)
+        key = _hashable_key(eff)
+        if key not in seen:
+            seen.add(key)
+            combos.append(eff)
 
     rows: List[ParamSearchResult] = []
 
@@ -508,6 +534,26 @@ def run_param_search(
         return sanitize_tuning_block(tuning)
 
     df = pd.DataFrame(recs)
+    # --- STRICT RESULT CHECK: no duplicate *effective* params allowed
+    def _effective_key_from_row(row: pd.Series):
+        eff = {k.replace("param_", ""): row[k] for k in row.index if k.startswith("param_")}
+        eff = _canonicalize_params_for_effect(eff)
+        return _hashable_key(eff)
+
+    if strict and not df.empty:
+        keys = df.apply(_effective_key_from_row, axis=1)
+        dup_mask = keys.duplicated(keep=False)
+        if dup_mask.any():
+            offenders = df.loc[
+                dup_mask,
+                [c for c in df.columns if c.startswith("param_")] + ["n_trades","total_pips","mean_pips","max_dd_pips"]
+            ]
+            examples = offenders.head(6).to_dict(orient="records")
+            raise RuntimeError(
+                "Duplicate effective parameter sets encountered in results. "
+                "Fix your grid (or pre-eval dedupe). Examples (truncated): "
+                f"{examples}"
+            )
 
     # Sort by our score (tuple works), descending (best first)
     # Pandas can't sort by arbitrary python tuples directly, so map to rank key
