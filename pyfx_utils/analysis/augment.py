@@ -249,16 +249,21 @@ def _round_value_for_brief(key, val):
       - Any key containing 'pips' -> int
       - 'win_rate' -> 3 decimals (fraction 0..1)
       - coverage ratios (keys ending with 'coverage') -> 3 decimals
-      - feature snapshot values like 'rsi@entry', 'adx@entry', 'bb_width@entry', 'atr_pips@entry':
+      - Percent/ratio-ish fields (anywhere, including snapshots):
+          * keys containing one of: 'pct', 'percent', 'ratio', 'bb_width'
+          * -> 4 decimals (kept as fraction, not percentage string)
+      - Feature snapshots like 'rsi@entry', 'adx@entry', 'bb_width@entry', 'atr_pips@entry':
           * if key contains 'atr_pips' -> int (pips)
-          * else -> round to 2 decimals
+          * else -> 2 decimals (unless ratio rule above triggers -> 4 decimals)
       - 'seconds_median' -> int, 'days_median' -> 2 decimals
-      - Monte Carlo fields (p05, p50, p95, exp, mdd05, p??_mdd) -> int (they’re pips)
+      - Monte Carlo fields (p05, p50, p95, exp, mdd05, p??_mdd) -> int (pips)
+      - Default numeric fallback -> 3 decimals
       - Leave timestamps/strings/None untouched
     """
     import math
+    import pandas as pd
 
-    # Coerce key to string for pattern tests (keys like 0.1 in pips_quantiles)
+    # Coerce key to string for pattern tests (handles numeric quantile keys)
     k = str(key)
 
     if val is None:
@@ -266,40 +271,61 @@ def _round_value_for_brief(key, val):
     if isinstance(val, (str, pd.Timestamp, pd.Timedelta)):
         return val
 
+    # --- Helpers
+    def _is_number(x):
+        try:
+            f = float(x)
+            return math.isfinite(f)
+        except Exception:
+            return False
+
+    def _is_ratio_key(s: str) -> bool:
+        s = s.lower()
+        return any(tag in s for tag in ("pct", "percent", "ratio", "bb_width"))
+
+    # If not numeric, return as-is
+    if not _is_number(val):
+        return val
+
+    f = float(val)
+
     # pips anywhere
     if "pips" in k:
-        return int(round(float(val)))
+        return int(round(f))
 
     # rates/coverage
     if k == "win_rate":
-        return round(float(val), 3)
+        return round(f, 3)
     if k.endswith("coverage"):
-        return round(float(val), 3)
+        return round(f, 3)
 
     # holding period
     if k == "seconds_median":
-        return int(round(float(val)))
+        return int(round(f))
     if k == "days_median":
-        return round(float(val), 2)
+        return round(f, 2)
 
     # monte carlo pips-like keys
     if k in {"p05","p50","p95","exp","mdd05","p05_mdd","p50_mdd","p95_mdd"}:
-        return int(round(float(val)))
+        return int(round(f))
 
     # feature snapshots
     if "@entry" in k or "@exit" in k:
         if "atr_pips" in k:
-            return int(round(float(val)))
-        return round(float(val), 2)
+            return int(round(f))
+        # If snapshot is ratio-like (e.g., bb_width@entry), use 4dp
+        if _is_ratio_key(k):
+            return round(f, 4)
+        # Otherwise default 2dp for snapshot values
+        return round(f, 2)
 
-    # default: if numeric and finite, round to 3 decimals
-    try:
-        f = float(val)
-        if math.isfinite(f):
-            return round(f, 3)
-    except Exception:
-        pass
-    return val
+    # general ratio-like keys anywhere else
+    if _is_ratio_key(k):
+        return round(f, 4)
+
+    # default numeric fallback
+    return round(f, 3)
+
 
 def _round_structure_for_brief(obj):
     """Walk the brief (dict/list/scalars) and apply _round_value_for_brief by key."""
