@@ -54,6 +54,10 @@ class StrategyRunPayload:
     params: Dict[str, Any]
     trades: pd.DataFrame                # must satisfy REQUIRED_TRADE_COLS schema
     bar_index: Optional[pd.DatetimeIndex] = None  # optional, for per-bar cumulative pips
+    regime_series: Optional[pd.Series] = None       # per-bar labels, DatetimeIndex
+    regimes_meta: Optional[Dict[str, Any]] = None   # e.g., {"k": 3, "...": ...}
+    active_regime: Optional[int] = None             # if omitted, we auto-pick
+
 
 # -----------------------------
 # Utilities & Validators

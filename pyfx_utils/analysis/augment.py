@@ -9,9 +9,10 @@ from dataclasses import asdict
 
 from ..backtests.signal import BTConfig
 from ..backtests.core import backtest
-from ..utils.stats import cumulative_pips, infer_pip_size
+from ..utils.stats import cumulative_pips, infer_pip_size, monte_carlo_summary
 from .regime import perf_by_regime, perf_by_regime_pips, build_regime_features, kmeans_regimes
 from .interfaces import normalize_side, StrategyRunPayload, validate_trades, OPTIONAL_TRADE_COLS
+from .walkforward import summarize_walk_forward
 
 # Canonical imports 
 from .tuning import (
@@ -151,6 +152,9 @@ def extend_brief_with_analyses(
     for rec in wf_rows:
       if isinstance(rec.get("params"), dict):
         rec["params"] = {k: _py_scalar(v) for k, v in rec["params"].items()}
+    
+    # Now add the walk_forward summary here
+    wf_summary = summarize_walk_forward(wf_rows) if wf_rows else {}
 
     # ---------------------------
     # 3) Stationarity
@@ -198,6 +202,7 @@ def extend_brief_with_analyses(
         "objective": objective_meta,
         "param_search": {"top": top, "best_params": best},
         "walk_forward": wf_rows,
+        "walk_forward_summary": wf_summary,
         "stationarity": {"close": st_close, "returns": st_ret},
         "regimes": regimes_block,
     }
@@ -248,10 +253,6 @@ def build_pips_brief(payload: StrategyRunPayload) -> Dict[str, Any]:
     # Normalize side for consistent downstream reads (does not mutate caller df)
     t["side_norm"] = normalize_side(t["side"])
     counts_by_side = t["side_norm"].value_counts(dropna=False).to_dict()
-    brief["counts"] = {
-        "n_long": int(counts_by_side.get("long", 0)),
-        "n_short": int(counts_by_side.get("short", 0)),
-    }
 
     overall = {
         "n_trades": int(len(t)),
@@ -285,7 +286,10 @@ def build_pips_brief(payload: StrategyRunPayload) -> Dict[str, Any]:
         "pips_quantiles": t["pips"].quantile([.1,.25,.5,.75,.9]).round(2).to_dict() if len(t) else {},
         "samples": samples.to_dict(orient="records") if not samples.empty else [],
     }
-    
+    brief["counts"] = {
+        "n_long": int(counts_by_side.get("long", 0)),
+        "n_short": int(counts_by_side.get("short", 0)),
+    }
     # ⬇️ Add the risk snapshot here
     brief["risk_snapshot"] = _risk_snapshot(t)
     brief["by_year"] = _by_year_rollups(t)
@@ -366,6 +370,34 @@ def build_pips_brief(payload: StrategyRunPayload) -> Dict[str, Any]:
 
     if notes:
         brief["notes"] = sorted(set(notes))
+    
+    try:
+        rs = getattr(payload, "regime_series", None)
+        if rs is not None and not rs.empty and "entry_time" in t.columns and "pips" in t.columns:
+            # choose regime: user-provided takes priority
+            active = getattr(payload, "active_regime", None)
+            selection = "provided"
+            if active is None:
+                # auto-pick regime with highest total pips (align label at entry_time)
+                et = pd.to_datetime(t["entry_time"], utc=True, errors="coerce")
+                labs = rs.reindex(et, method="ffill")
+                by_reg = t.groupby(labs)["pips"].sum().dropna()
+                if len(by_reg):
+                    active = int(by_reg.idxmax())
+                    selection = "auto"
+
+            if active is not None:
+                brief["regime_filter_eval"] = evaluate_regime_filter(
+                    trades=t,
+                    regime_series=rs,
+                    active_regime=active,
+                    regimes_meta=getattr(payload, "regimes_meta", None),
+                )
+                brief["regime_filter_eval"]["selection"] = selection
+                brief["regime_filter_eval"]["active_regime"] = int(active)
+    except Exception:
+        pass
+    
     return _jsonify(brief)
 
 

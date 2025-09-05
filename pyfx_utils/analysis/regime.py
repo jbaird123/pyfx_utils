@@ -1,3 +1,5 @@
+from __future__ import annotations
+from typing import Dict, Any, Optional
 import pandas as pd 
 import numpy as np
 try:
@@ -135,3 +137,53 @@ def perf_by_regime_pips(pips_per_bar: pd.Series, labels: pd.Series) -> pd.DataFr
             "std_pips": float(grp.std(ddof=0)),
         })
     return pd.DataFrame(rows).sort_values("total_pips", ascending=False).reset_index(drop=True)
+
+def evaluate_regime_filter(
+    trades: pd.DataFrame,
+    regime_series: pd.Series,
+    active_regime: int,
+    *,
+    regimes_meta: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    Evaluate 'trade only when regime == active_regime' vs. unfiltered.
+    Aligns regime labels to trade entry times via forward-fill reindex.
+
+    Returns:
+      {
+        'k': <clusters if available>,
+        'active_regime': int,
+        'filtered_total_pips': float,
+        'unfiltered_total_pips': float,
+        'delta': float,
+        'kept_trades': int,
+        'total_trades': int
+      }
+    """
+    out = {
+        "k": int(regimes_meta.get("k", 0)) if isinstance(regimes_meta, dict) else 0,
+        "active_regime": int(active_regime),
+        "filtered_total_pips": 0.0,
+        "unfiltered_total_pips": 0.0,
+        "delta": 0.0,
+        "kept_trades": 0,
+        "total_trades": int(len(trades) if trades is not None else 0),
+    }
+    if trades is None or trades.empty or regime_series is None or regime_series.empty:
+        return out
+
+    # align labels at each entry_time
+    entry_times = pd.to_datetime(trades["entry_time"], utc=True, errors="coerce")
+    labs = regime_series.reindex(entry_times, method="ffill")
+
+    mask = (labs == active_regime)
+    filtered_total = float(trades.loc[mask.fillna(False), "pips"].sum())
+    unfiltered_total = float(trades["pips"].sum())
+
+    out.update({
+        "filtered_total_pips": filtered_total,
+        "unfiltered_total_pips": unfiltered_total,
+        "delta": float(filtered_total - unfiltered_total),
+        "kept_trades": int(mask.fillna(False).sum()),
+    })
+    return out
