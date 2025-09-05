@@ -278,14 +278,24 @@ def build_pips_brief(payload: StrategyRunPayload) -> Dict[str, Any]:
     sample_cols = base_cols + snapshot_cols
     samples = t[sample_cols].head(25) if sample_cols else pd.DataFrame()
 
-    brief: Dict[str, Any] = {
-        "meta": asdict(payload.meta),
+    # SAFETY: bind 'brief' before any later mutations
+    brief: Dict[str, Any] = {}
+    # Build the core block in small, safe steps so a failure doesn't leave 'brief' unbound
+    meta_dict = asdict(payload.meta)
+    # (Optional) harden meta types (in case future callers pass a Timestamp again)
+    ts_val = meta_dict.get("timestamp")
+    if isinstance(ts_val, pd.Timestamp):
+        meta_dict["timestamp"] = ts_val.isoformat()
+        
+    brief.update({
+        "meta": meta_dict,
         "params": payload.params,
         "overall_pips": overall,
         "columns_present": list(t.columns),
         "pips_quantiles": t["pips"].quantile([.1,.25,.5,.75,.9]).round(2).to_dict() if len(t) else {},
         "samples": samples.to_dict(orient="records") if not samples.empty else [],
-    }
+    })
+    
     brief["counts"] = {
         "n_long": int(counts_by_side.get("long", 0)),
         "n_short": int(counts_by_side.get("short", 0)),
