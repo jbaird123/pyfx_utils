@@ -43,13 +43,16 @@ def boot(code_dir="/content/drive/MyDrive/fx/code", ensure=("lightweight-charts"
 
     # analysis
     from pyfx_utils.analysis import (
-        equity_curve_from_trades, equity_curve_from_signal, metrics,
+        metrics,
         trade_pnls, metrics_by_period,
-        annotate_trades_with_indicators, walk_forward_ranges
+        annotate_trades, walk_forward_ranges
     )
 
     # backtests (signal vector backtester, optional)
-    from pyfx_utils.backtests import BTConfig, backtest_signal
+    from pyfx_utils.backtests import (
+        BTConfig, backtest_signal, 
+        equity_curve_from_trades, equity_curve_from_signal
+    )
 
 
     # 5) Return a namespace dict that %pyfx_boot will inject into globals()
@@ -66,7 +69,7 @@ def boot(code_dir="/content/drive/MyDrive/fx/code", ensure=("lightweight-charts"
         equity_curve_from_trades=equity_curve_from_trades,
         equity_curve_from_signal=equity_curve_from_signal,
         metrics=metrics, trade_pnls=trade_pnls,
-        metrics_by_period=metrics_by_period, annotate_trades_with_indicators=annotate_trades_with_indicators,
+        metrics_by_period=metrics_by_period, annotate_trades=annotate_trades,
         walk_forward_ranges=walk_forward_ranges,
         # backtests
         BTConfig=BTConfig, backtest_signal=backtest_signal,
