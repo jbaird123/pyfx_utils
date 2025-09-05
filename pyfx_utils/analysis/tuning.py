@@ -655,8 +655,7 @@ def run_param_search(
     param_cols = [c for c in df.columns if c.startswith("param_")]
 
     # 1) Normalize: force object dtype and convert float NaN -> None
-    def _nan_to_none(x):
-        return None if (isinstance(x, float) and math.isnan(x)) else x
+    from .augment import _nan_to_none
 
     for c in param_cols:
         # column-wise map avoids the applymap deprecation warning

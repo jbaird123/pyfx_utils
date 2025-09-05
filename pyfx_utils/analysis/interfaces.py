@@ -35,7 +35,8 @@ REQUIRED_TRADE_COLS: List[str] = [
 # All are scalars per trade (no money metrics). Add freely as needed.
 OPTIONAL_TRADE_COLS: List[str] = [
     "symbol", "setup_id", "signal_name",
-    "atr@entry", "rsi@entry", "adx@entry", "bb_width@entry",
+    "atr@entry", "atr_pips@entry", "rsi@entry", 
+    "adx@entry", "bb_width@entry",
     "mfe_pips", "mae_pips"
 ]
 

@@ -222,26 +222,32 @@ def _risk_snapshot(t):
         "max_loss": float(t["pips"].min()),
     }
 
-def _jsonify(obj):
-    """Convert pandas/numpy objects to plain JSON-serializable Python types."""
-    if obj is None:
+
+def _nan_to_none(x):
+    if isinstance(x, float) and math.isnan(x):
         return None
-    # pandas types
-    if isinstance(obj, pd.Timestamp):
-        return None if pd.isna(obj) else obj.isoformat()
-    if isinstance(obj, pd.Timedelta):
-        return obj.total_seconds()
-    if isinstance(obj, (pd.Series, pd.Index)):
-        return [_jsonify(x) for x in obj.tolist()]
-    # numpy scalars
-    if isinstance(obj, np.generic):
-        return obj.item()
-    # containers
+    if pd.isna(x):  # catches NaT, NA, pd.NA, etc.
+        return None
+    return x
+
+
+def _jsonify(obj):
+    # Dict
     if isinstance(obj, dict):
-        return {str(k): _jsonify(v) for k, v in obj.items()}
+        return {k: _jsonify(_nan_to_none(v)) for k, v in obj.items()}
+    # List/Tuple
     if isinstance(obj, (list, tuple)):
-        return [_jsonify(v) for v in obj]
-    return obj
+        return [ _jsonify(_nan_to_none(v)) for v in obj ]
+    # Numpy scalars → Python
+    try:
+        import numpy as np
+        if isinstance(obj, (np.generic,)):
+            obj = obj.item()
+    except Exception:
+        pass
+    # Final scalar pass
+    return _nan_to_none(obj)
+
 
 def _round_value_for_brief(key, val):
     """
@@ -301,7 +307,8 @@ def _round_value_for_brief(key, val):
     if k == "seconds_median":
         return int(round(f))
     if k == "days_median":
-        return round(f, 2)
+        f = float(val)
+        return int(f) if f.is_integer() else round(f, 2)
 
     # monte carlo pips-like keys
     if k in {"p05","p50","p95","exp","mdd05","p05_mdd","p50_mdd","p95_mdd"}:
@@ -347,6 +354,9 @@ def build_pips_brief(payload: StrategyRunPayload) -> Dict[str, Any]:
     """
     validate_trades(payload.trades)
     t = payload.trades.copy()
+    # Ensure chronological order for DD/cumulative
+    if "entry_time" in t.columns:
+        t = t.sort_values("entry_time")
 
     # Normalize side for consistent downstream reads (does not mutate caller df)
     t["side_norm"] = normalize_side(t["side"])
@@ -473,6 +483,11 @@ def build_pips_brief(payload: StrategyRunPayload) -> Dict[str, Any]:
             notes.append("No long trades recorded. Upstream filters or entry logic may be suppressing longs.")
         if brief.get("counts", {}).get("n_short", 0) == 0:
             notes.append("No short trades recorded. Upstream filters or entry logic may be suppressing shorts.")
+        try:
+            if not brief.get("costs", {}).get("applied", False):
+                notes.append("Trading costs are NOT applied in these results.")
+        except Exception:
+            pass
     except Exception:
         pass
 
