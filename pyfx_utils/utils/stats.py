@@ -68,44 +68,98 @@ def streaks(trades):
           cur_l += 1; max_l = max(max_l, cur_l); cur_w = 0
   return (int(max_w), int(max_l))
 
-def monte_carlo_trades(
+def _monte_carlo_paths(
     trade_pips: pd.Series | np.ndarray,
     iters: int = 2000,
-    horizon: int = 200,
+    horizon: int | None = None,
     seed: int = 42,
 ) -> np.ndarray:
-    """Bootstrap trade pips to simulate equity paths of length `horizon` trades.
+    """
+    Bootstrap trade pips to simulate equity paths of length `horizon` trades.
     Returns array shape (iters, horizon) of cumulative pips paths.
     """
     rng = np.random.default_rng(seed)
     arr = np.asarray(trade_pips, dtype=float)
     if arr.size == 0:
-        return np.zeros((iters, horizon))
-    out = np.empty((iters, horizon), dtype=float)
+        hor = (horizon if (horizon and horizon > 0) else 0) or 0
+        return np.zeros((iters, max(hor, 0)))
+    hor = arr.size if (horizon is None or horizon <= 0) else int(horizon)
+    out = np.empty((iters, hor), dtype=float)
     for i in range(iters):
-        sample = rng.choice(arr, size=horizon, replace=True)
+        sample = rng.choice(arr, size=hor, replace=True)
         out[i] = sample.cumsum()
     return out
 
+def monte_carlo_summary(
+    trade_pips: pd.Series | np.ndarray,
+    iters: int = 2000,
+    horizon: int | None = None,
+    seed: int = 42,
+    percentiles: Iterable[float] = (5, 50, 95),
+) -> Dict[str, float]:
+    """
+    Summary statistics for Monte Carlo bootstrapped equity paths built from trade-level pips.
 
-def mc_summary(paths: np.ndarray) -> Dict[str, float]:
+    Returns (JSON-friendly):
+      - p05, p50, p95: percentiles of ending total pips (matches your existing names)
+      - exp: mean of ending totals (expected ending pips)
+      - mdd05: max drawdown of the path whose ending total is at the 5th percentile
+      Additionally (non-breaking enrichments):
+      - p05_mdd, p50_mdd, p95_mdd: percentiles of per-path max drawdowns
+      - prob_neg_total: probability the ending total is negative
+    """
+    paths = _monte_carlo_paths(trade_pips, iters=iters, horizon=horizon, seed=seed)
     if paths.size == 0:
-        return {'p05':0.0,'p50':0.0,'p95':0.0,'exp':0.0,'mdd05':0.0}
+        return {
+            "p05": 0.0, "p50": 0.0, "p95": 0.0, "exp": 0.0, "mdd05": 0.0,
+            "p05_mdd": 0.0, "p50_mdd": 0.0, "p95_mdd": 0.0, "prob_neg_total": 0.0,
+            "n_sims": int(paths.shape[0]), "horizon": int(paths.shape[1]) if paths.ndim == 2 else 0,
+        }
+
     final = paths[:, -1]
-    p05, p50, p95 = np.percentile(final, [5,50,95])
+    q = np.percentile
+    p = sorted(set(percentiles))
+    # Ending totals percentiles (keep your original names for 5/50/95)
+    pcts = q(final, p).tolist()
+    pct_map = {int(x): float(v) for x, v in zip(p, pcts)}
+    p05 = pct_map.get(5, float(q(final, 5)))
+    p50 = pct_map.get(50, float(q(final, 50)))
+    p95 = pct_map.get(95, float(q(final, 95)))
     exp = float(final.mean())
-    # 5th percentile path max DD (conservative)
-    worst_idx = np.argsort(final)[int(0.05*len(final))]
-    eq = paths[worst_idx]
-    roll_max = np.maximum.accumulate(eq)
-    dd = eq - roll_max
+
+    # Compute per-path max drawdowns
+    roll_max = np.maximum.accumulate(paths, axis=1)
+    dd = paths - roll_max
+    mdds = dd.min(axis=1)  # negative numbers
+
+    # mdd05: your original definition—DD of the path whose ending total is ~5th percentile
+    worst_idx = int(np.clip(round(0.05 * (len(final) - 1)), 0, len(final) - 1))
+    idx_sorted = np.argsort(final)  # ascending by ending total
+    eq_5th = paths[idx_sorted[worst_idx]]
+    rm_5th = np.maximum.accumulate(eq_5th)
+    dd_5th = eq_5th - rm_5th
+    mdd05 = float(dd_5th.min())
+
+    # Extra (useful) fields—percentiles of the MDD distribution + prob of loss
+    p05_mdd = float(q(mdds, 5))
+    p50_mdd = float(q(mdds, 50))
+    p95_mdd = float(q(mdds, 95))
+    prob_neg_total = float((final < 0).mean())
+
     return {
-        'p05': float(p05),
-        'p50': float(p50),
-        'p95': float(p95),
-        'exp': float(exp),
-        'mdd05': float(dd.min()),
+        "p05": float(p05),
+        "p50": float(p50),
+        "p95": float(p95),
+        "exp": float(exp),
+        "mdd05": mdd05,
+        "p05_mdd": p05_mdd,
+        "p50_mdd": p50_mdd,
+        "p95_mdd": p95_mdd,
+        "prob_neg_total": prob_neg_total,
+        "n_sims": int(paths.shape[0]),
+        "horizon": int(paths.shape[1]),
     }
+
 
 def compute_pips(df: pd.DataFrame, symbol: str) -> pd.Series:
     """

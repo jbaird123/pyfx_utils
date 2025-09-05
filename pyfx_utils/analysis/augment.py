@@ -247,6 +247,11 @@ def build_pips_brief(payload: StrategyRunPayload) -> Dict[str, Any]:
 
     # Normalize side for consistent downstream reads (does not mutate caller df)
     t["side_norm"] = normalize_side(t["side"])
+    counts_by_side = t["side_norm"].value_counts(dropna=False).to_dict()
+    brief["counts"] = {
+        "n_long": int(counts_by_side.get("long", 0)),
+        "n_short": int(counts_by_side.get("short", 0)),
+    }
 
     overall = {
         "n_trades": int(len(t)),
@@ -283,6 +288,53 @@ def build_pips_brief(payload: StrategyRunPayload) -> Dict[str, Any]:
     
     # ⬇️ Add the risk snapshot here
     brief["risk_snapshot"] = _risk_snapshot(t)
+    brief["by_year"] = _by_year_rollups(t)
+    brief["holding_period"] = _holding_period(t)
+    brief["max_dd_pips"] = _max_dd_over_trades(t)
+
+    # If payload contains bt_config, surface it; otherwise default zeros
+    costs = {"fee_bps": 0.0, "slippage_bps": 0.0, "applied": False}
+    if hasattr(payload, "bt_config") and payload.bt_config is not None:
+        cfg = payload.bt_config
+        costs = {
+            "fee_bps": float(getattr(cfg, "fee_bps", 0.0)),
+            "slippage_bps": float(getattr(cfg, "slippage_bps", 0.0)),
+            "applied": True
+        }
+    brief["costs"] = costs
+
+    # From trades (always available if you have trades)
+    start_ts = pd.to_datetime(t["entry_time"], utc=True, errors="coerce").min() if "entry_time" in t.columns else None
+    end_ts   = pd.to_datetime(t["exit_time"],  utc=True, errors="coerce").max() if "exit_time"  in t.columns else None
+    brief["data_window"] = {
+        "from": None if pd.isna(start_ts) else (start_ts.isoformat() if start_ts is not None else None),
+        "to":   None if pd.isna(end_ts)   else (end_ts.isoformat() if end_ts   is not None else None),
+    }
+    # If you have payload.bar_index (price index), you can optionally add bars
+    if payload.bar_index is not None and len(payload.bar_index) > 0:
+        brief["data_window"]["bars"] = int(len(payload.bar_index))
+
+    if getattr(payload, "feature_cols", None):
+        brief["feature_coverage"] = _feature_coverage(payload.trades, payload.feature_cols)
+
+    # Monte Carlo (safe, optional)
+    try:
+        if "pips" in t.columns and len(t):
+            brief["monte_carlo"] = monte_carlo_summary(
+                t["pips"],
+                iters=5000,         # tweak if you like
+                horizon=None,       # None => use len(pips)
+                seed=42
+            )
+        else:
+            brief["monte_carlo"] = {
+                "p05": 0.0, "p50": 0.0, "p95": 0.0, "exp": 0.0, "mdd05": 0.0,
+                "p05_mdd": 0.0, "p50_mdd": 0.0, "p95_mdd": 0.0,
+                "prob_neg_total": 0.0, "n_sims": 0, "horizon": 0
+            }
+    except Exception:
+        # Keep the brief robust even if MC fails
+        pass
 
     # Optional: include a tiny spark of the cumulative curve if bar_index is given
     if payload.bar_index is not None and len(payload.bar_index) > 0:
@@ -301,6 +353,19 @@ def build_pips_brief(payload: StrategyRunPayload) -> Dict[str, Any]:
             # Don't fail the brief if cumulative calculation can't be constructed
             pass
 
+    # Optional non-fatal diagnostics
+    notes = []
+    try:
+        # If no longs/shorts, hint
+        if brief.get("counts", {}).get("n_long", 0) == 0:
+            notes.append("No long trades recorded. Upstream filters or entry logic may be suppressing longs.")
+        if brief.get("counts", {}).get("n_short", 0) == 0:
+            notes.append("No short trades recorded. Upstream filters or entry logic may be suppressing shorts.")
+    except Exception:
+        pass
+
+    if notes:
+        brief["notes"] = sorted(set(notes))
     return _jsonify(brief)
 
 
@@ -407,4 +472,60 @@ def annotate_trades(
         snapped = merged[feats_present].add_suffix(f"@{at}").reset_index(drop=True)
         out = out.reset_index(drop=True).join(snapped)
 
+    return out
+
+def _by_year_rollups(trades: pd.DataFrame) -> list[dict]:
+    t = trades.copy()
+    if "entry_time" not in t.columns:
+        return []
+    t["entry_time"] = pd.to_datetime(t["entry_time"], utc=True, errors="coerce")
+    grp = t.dropna(subset=["entry_time"]).groupby(t["entry_time"].dt.year, dropna=True)
+    out = []
+    for y, g in grp:
+        out.append({
+            "year": int(y),
+            "n_trades": int(len(g)),
+            "total_pips": float(g["pips"].sum()),
+            "mean_pips": float(g["pips"].mean()) if len(g) else 0.0,
+            "median_pips": float(g["pips"].median()) if len(g) else 0.0,
+        })
+    return out
+
+def _holding_period(trades: pd.DataFrame) -> dict:
+    t = trades.copy()
+    out = {}
+    # bars if present
+    if "entry_index" in t.columns and "exit_index" in t.columns:
+        bars = (t["exit_index"] - t["entry_index"]).astype("Int64")
+        bars = bars.dropna()
+        if len(bars):
+            out["bars_median"] = int(bars.median())
+            out["bars_mean"] = float(bars.mean())
+    # time if present
+    if "entry_time" in t.columns and "exit_time" in t.columns:
+        et = pd.to_datetime(t["entry_time"], utc=True, errors="coerce")
+        xt = pd.to_datetime(t["exit_time"],  utc=True, errors="coerce")
+        hp = (xt - et).dropna()
+        if len(hp):
+            out["seconds_median"] = float(hp.dt.total_seconds().median())
+            out["days_median"] = float((hp.dt.total_seconds() / 86400).median())
+    return out
+
+def _max_dd_over_trades(trades: pd.DataFrame) -> float:
+    # order as recorded; if you prefer chronological, sort by entry_time first
+    cp = trades["pips"].astype(float).cumsum()
+    dd = cp - cp.cummax()
+    return float(dd.min()) if len(dd) else 0.0
+
+def _feature_coverage(df: pd.DataFrame, feature_cols: list[str]) -> list[dict]:
+    out = []
+    feats = [c for c in feature_cols if c in df.columns]
+    for c in feats:
+        s = df[c]
+        out.append({
+            "feature": c,
+            "present": int(s.notna().sum()),
+            "missing": int(s.isna().sum()),
+            "coverage": float(s.notna().mean()),
+        })
     return out
