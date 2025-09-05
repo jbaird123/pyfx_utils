@@ -689,60 +689,56 @@ def _is_number(x):
     except Exception:
         return False
 
-# Keys that should be ints if numeric & integral (outside params)
+# Fields that should be ints if numeric
 _INT_KEYS_EXACT = {
     "n_trades", "seconds_median", "bars", "year",
     "n_sims", "horizon", "n_long", "n_short",
     "total_pips", "max_dd_pips", "mdd05",
 }
 
-def _coerce_scalar_type(key: str, val, *, in_params: bool):
-    """
-    Snap types after rounding: ints where expected, booleans restored.
-    `in_params` indicates we're inside the 'params' dict.
-    """
+def _coerce_scalar_type(key: str, val, *, in_params: bool, parent_key: str | None):
     k = str(key)
 
-    # Preserve None/strings/timestamps
+    # Leave None/strings/timestamps alone
     if val is None or isinstance(val, (str, pd.Timestamp, pd.Timedelta)):
         return val
 
-    # Preserve existing bools
+    # Keep real bools as-is
     if isinstance(val, bool):
         return val
 
-    # Restore booleans that may have become 0/1 numerically
-    if k.endswith("applied") and _is_number(val):
+    # Restore applied -> bool if it drifted to 0/1
+    if k == "applied" and _is_number(val):
         return bool(int(round(float(val))))
 
-    # Inside params: coerce any integral numeric to int
+    # Inside params: any integral numeric -> int (e.g., fast/slow/atr_length)
     if in_params and _is_number(val):
         f = float(val)
-        if f.is_integer():
-            return int(f)
-        return f  # leave non-integral as float
+        return int(f) if f.is_integer() else f
 
-    # Outside params: explicit int fields
+    # Side totals: force ints (you want whole pips)
+    if parent_key == "by_side_total_pips" and _is_number(val):
+        return int(round(float(val)))
+
+    # Known int keys elsewhere
     if k in _INT_KEYS_EXACT and _is_number(val):
-        f = float(val)
-        return int(round(f))
+        return int(round(float(val)))
 
     return val
 
-def _coerce_tree(obj, *, in_params: bool = False):
-    """
-    Walks the structure; when entering the 'params' dict, sets in_params=True
-    so param values get int-coerced if integral.
-    """
+def _coerce_tree(obj, *, in_params: bool = False, parent_key: str | None = None):
     if isinstance(obj, dict):
         out = {}
+        # entering params?
+        child_in_params = in_params or (parent_key == "params")
         for k, v in obj.items():
-            child_in_params = in_params or (k == "params")
-            out[k] = _coerce_tree(v, in_params=child_in_params)
+            if isinstance(v, (dict, list)):
+                out[k] = _coerce_tree(v, in_params=child_in_params, parent_key=k)
+            else:
+                out[k] = _coerce_scalar_type(k, v, in_params=child_in_params, parent_key=parent_key)
         return out
     elif isinstance(obj, list):
-        return [_coerce_tree(v, in_params=in_params) for v in obj]
+        return [_coerce_tree(v, in_params=in_params, parent_key=parent_key) for v in obj]
     else:
-        # Leaf scalar
-        parent_key = ""  # we only need the immediate key at the dict level; for leaves we don’t have it
-        return _coerce_scalar_type(parent_key, obj, in_params=in_params)
+        # leaf without key context (rare)
+        return _coerce_scalar_type("", obj, in_params=in_params, parent_key=parent_key)
