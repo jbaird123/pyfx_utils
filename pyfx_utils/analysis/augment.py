@@ -508,8 +508,21 @@ def build_pips_brief(payload: StrategyRunPayload) -> Dict[str, Any]:
     except Exception:
         pass
     
+    # Snap by_side_total_pips to int pips as a display convention
+    if "overall_pips" in brief and isinstance(brief["overall_pips"], dict):
+        bs = brief["overall_pips"].get("by_side_total_pips")
+        if isinstance(bs, dict):
+            bs_fixed = {}
+            for side, v in bs.items():
+                if _is_number(v):
+                    bs_fixed[side] = int(round(float(v)))
+                else:
+                    bs_fixed[side] = v
+            brief["overall_pips"]["by_side_total_pips"] = bs_fixed
+    
     brief_rounded = _round_structure_for_brief(brief)
     return _jsonify(brief_rounded)
+
 
 
 
@@ -673,3 +686,63 @@ def _feature_coverage(df: pd.DataFrame, feature_cols: list[str]) -> list[dict]:
             "coverage": float(s.notna().mean()),
         })
     return out
+
+def _is_number(x):
+    try:
+        return math.isfinite(float(x))
+    except Exception:
+        return False
+
+# Keys that should be ints if numeric & integral
+_INT_KEYS_EXACT = {
+    "n_trades", "seconds_median", "bars", "year",
+    "n_sims", "horizon", "n_long", "n_short",
+    "total_pips", "max_dd_pips", "mdd05",
+}
+
+# Param names that should be ints if integral
+_PARAM_INTLIKE = {"fast", "slow", "atr_length"}
+
+def _coerce_scalar_type(key: str, val):
+    """
+    Snap types after rounding: ints where expected, booleans restored.
+    """
+    k = str(key)
+
+    # Preserve None/strings/timestamps
+    if val is None or isinstance(val, (str, pd.Timestamp, pd.Timedelta)):
+        return val
+
+    # Preserve existing bools
+    if isinstance(val, bool):
+        return val
+
+    # Restore booleans that may have become 0/1 numerically
+    if k.endswith("applied") and _is_number(val):
+        f = float(val)
+        return bool(int(round(f)))
+
+    # Explicit int fields
+    if k in _INT_KEYS_EXACT and _is_number(val):
+        f = float(val)
+        return int(round(f))
+
+    # Params that are int-like
+    if (k.startswith("param_") and k.replace("param_", "") in _PARAM_INTLIKE) or (k in _PARAM_INTLIKE):
+        if _is_number(val):
+            f = float(val)
+            if f.is_integer():
+                return int(f)
+
+    return val
+
+def _coerce_tree(obj, parent_key=None):
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            out[k] = _coerce_tree(v, k)
+        return out
+    elif isinstance(obj, list):
+        return [_coerce_tree(v, parent_key) for v in obj]
+    else:
+        return _coerce_scalar_type(parent_key or "", obj)
