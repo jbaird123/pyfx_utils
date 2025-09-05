@@ -2,7 +2,7 @@
 def boot(code_dir="/content/drive/MyDrive/fx/code", ensure=("lightweight-charts",)):
     import os, sys, importlib, subprocess
 
-    # 1) Mount Drive (Colab)
+    # 1) Mount Drive (in Colab)
     try:
         from google.colab import drive  # type: ignore
         if not os.path.ismount("/content/drive"):
@@ -14,13 +14,13 @@ def boot(code_dir="/content/drive/MyDrive/fx/code", ensure=("lightweight-charts"
     if code_dir not in sys.path:
         sys.path.insert(0, code_dir)
 
-    # 3) Hot-reload pyfx_utils to pick up local edits
+    # 3) Hard-reload pyfx_utils to pick up local edits
     for m in list(sys.modules):
         if m.startswith("pyfx_utils"):
             del sys.modules[m]
     importlib.invalidate_caches()
 
-    # 3b) Ensure optional deps (module names may differ from pip names)
+    # 3b) Ensure optional deps
     for p in ensure or ():
         mod = p.replace("-", "_")
         try:
@@ -41,11 +41,12 @@ def boot(code_dir="/content/drive/MyDrive/fx/code", ensure=("lightweight-charts"
 
     # utils
     from pyfx_utils.utils import load_fx_csv, resample
-    from pyfx_utils.utils.stats import infer_pip_size, compute_pips  # no pip_factor anymore
+    from pyfx_utils.utils.stats import infer_pip_size, compute_pips
 
-    # analysis (your new helpers / interfaces)
+    # analysis
     from pyfx_utils.analysis import annotate_trades, walk_forward_ranges
-    from pyfx_utils.analysis.interfaces import build_pips_brief, StrategyRunMeta
+    from pyfx_utils.analysis.augment import build_pips_brief   # <-- FIXED import
+    from pyfx_utils.analysis.interfaces import StrategyRunMeta
 
     # backtests
     from pyfx_utils.backtests import (
