@@ -224,11 +224,16 @@ def _risk_snapshot(t):
 
 
 def _nan_to_none(x):
+    import math, pandas as pd
+    # Scalars only — pass arrays/lists back unchanged
+    if isinstance(x, (list, tuple, pd.Series, pd.Index, np.ndarray)):
+        return x
     if isinstance(x, float) and math.isnan(x):
         return None
-    if pd.isna(x):  # catches NaT, NA, pd.NA, etc.
+    if pd.isna(x):  # catches NaT, pd.NA, etc. (scalar only here)
         return None
     return x
+
 
 
 def _jsonify(obj):
