@@ -243,7 +243,7 @@ def _jsonify(obj):
         return [_jsonify(v) for v in obj]
     return obj
 
-def _round_value_for_brief(key: str, val):
+def _round_value_for_brief(key, val):
     """
     Rounding policy for the brief:
       - Any key containing 'pips' -> int
@@ -257,38 +257,42 @@ def _round_value_for_brief(key: str, val):
       - Leave timestamps/strings/None untouched
     """
     import math
+
+    # Coerce key to string for pattern tests (keys like 0.1 in pips_quantiles)
+    k = str(key)
+
     if val is None:
         return None
     if isinstance(val, (str, pd.Timestamp, pd.Timedelta)):
         return val
 
     # pips anywhere
-    if "pips" in key:
+    if "pips" in k:
         return int(round(float(val)))
 
     # rates/coverage
-    if key == "win_rate":
+    if k == "win_rate":
         return round(float(val), 3)
-    if key.endswith("coverage"):
+    if k.endswith("coverage"):
         return round(float(val), 3)
 
     # holding period
-    if key == "seconds_median":
+    if k == "seconds_median":
         return int(round(float(val)))
-    if key == "days_median":
+    if k == "days_median":
         return round(float(val), 2)
 
     # monte carlo pips-like keys
-    if key in {"p05","p50","p95","exp","mdd05","p05_mdd","p50_mdd","p95_mdd"}:
+    if k in {"p05","p50","p95","exp","mdd05","p05_mdd","p50_mdd","p95_mdd"}:
         return int(round(float(val)))
 
     # feature snapshots
-    if "@entry" in key or "@exit" in key:
-        if "atr_pips" in key:
+    if "@entry" in k or "@exit" in k:
+        if "atr_pips" in k:
             return int(round(float(val)))
         return round(float(val), 2)
 
-    # default: if numeric and finite, round to 3 decimals to keep things tidy
+    # default: if numeric and finite, round to 3 decimals
     try:
         f = float(val)
         if math.isfinite(f):
@@ -296,7 +300,6 @@ def _round_value_for_brief(key: str, val):
     except Exception:
         pass
     return val
-
 
 def _round_structure_for_brief(obj):
     """Walk the brief (dict/list/scalars) and apply _round_value_for_brief by key."""
