@@ -179,7 +179,7 @@ def extend_brief_with_analyses(
           pips_per_bar = pips_curve.diff().fillna(0.0)                      # per-bar pips increments
 
           # Performance by regime (pips)
-          from .perf import perf_by_regime_pips
+          from .regime import perf_by_regime_pips
           perf_r = perf_by_regime_pips(pips_per_bar, labs)
 
           regimes_block = {
@@ -204,6 +204,39 @@ def extend_brief_with_analyses(
 # -----------------------------
 # Brief builder (pips-only)
 # -----------------------------
+def _risk_snapshot(t):
+    if len(t) == 0:
+        return {}
+    wins = t["pips"] > 0
+    loss = t["pips"] <= 0
+    return {
+        "win_rate": float(wins.mean()),
+        "avg_win": float(t.loc[wins, "pips"].mean()) if wins.any() else 0.0,
+        "avg_loss": float(t.loc[loss, "pips"].mean()) if loss.any() else 0.0,
+        "max_win": float(t["pips"].max()),
+        "max_loss": float(t["pips"].min()),
+    }
+
+def _jsonify(obj):
+    """Convert pandas/numpy objects to plain JSON-serializable Python types."""
+    if obj is None:
+        return None
+    # pandas types
+    if isinstance(obj, pd.Timestamp):
+        return None if pd.isna(obj) else obj.isoformat()
+    if isinstance(obj, pd.Timedelta):
+        return obj.total_seconds()
+    if isinstance(obj, (pd.Series, pd.Index)):
+        return [_jsonify(x) for x in obj.tolist()]
+    # numpy scalars
+    if isinstance(obj, np.generic):
+        return obj.item()
+    # containers
+    if isinstance(obj, dict):
+        return {str(k): _jsonify(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonify(v) for v in obj]
+    return obj
 
 def build_pips_brief(payload: StrategyRunPayload) -> Dict[str, Any]:
     """
@@ -247,6 +280,9 @@ def build_pips_brief(payload: StrategyRunPayload) -> Dict[str, Any]:
         "pips_quantiles": t["pips"].quantile([.1,.25,.5,.75,.9]).round(2).to_dict() if len(t) else {},
         "samples": samples.to_dict(orient="records") if not samples.empty else [],
     }
+    
+    # ⬇️ Add the risk snapshot here
+    brief["risk_snapshot"] = _risk_snapshot(t)
 
     # Optional: include a tiny spark of the cumulative curve if bar_index is given
     if payload.bar_index is not None and len(payload.bar_index) > 0:
@@ -265,7 +301,7 @@ def build_pips_brief(payload: StrategyRunPayload) -> Dict[str, Any]:
             # Don't fail the brief if cumulative calculation can't be constructed
             pass
 
-    return brief
+    return _jsonify(brief)
 
 
 def annotate_trades(
