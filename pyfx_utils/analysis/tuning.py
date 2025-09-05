@@ -385,17 +385,78 @@ class ParamSearchResult:
 def _expand_param_grid(param_grid: Dict[str, Iterable[Any]]) -> List[Dict[str, Any]]:
     """
     Expand a scikit-like param_grid (each value is an iterable) into a list of
-    concrete parameter dicts. Handles values including None.
-    Example:
-        {"fast": [10, 20], "slow": [50], "stop_type": [None, "atr"], "stop_value": [None, 2]}
+    concrete parameter dicts. Supports *paired* keys:
+        - (stop_type,  stop_value)
+        - (tp_type,    tp_value)
+        - (trail_type, trail_value)
+
+    Rules for a paired group:
+      - If type is None => value must be None (emit exactly that pair).
+      - If type is not None => value must be a real number (skip None/NaN).
+      - If a value list omits None for the None type, we still enforce value=None.
+
+    Any other keys are treated as independent dimensions.
     """
-    keys = list(param_grid.keys())
-    values = [list(v) for v in param_grid.values()]
-    combos = []
-    for tpl in product(*values):
-        p = {k: v for k, v in zip(keys, tpl)}
-        combos.append(p)
+    import math
+    # Helper to build valid pairs for a group if present
+    def group_pairs(prefix: str) -> Optional[List[Dict[str, Any]]]:
+        tkey, vkey = f"{prefix}_type", f"{prefix}_value"
+        if tkey not in param_grid and vkey not in param_grid:
+            return None
+        t_list = list(param_grid.get(tkey, [None]))
+        v_list = list(param_grid.get(vkey, [None]))
+        pairs: List[Dict[str, Any]] = []
+        for tt in t_list:
+            if tt is None:
+                # force value None for None type
+                pairs.append({tkey: None, vkey: None})
+            else:
+                for vv in v_list:
+                    if vv is None or (isinstance(vv, float) and math.isnan(vv)):
+                        # illegal with a real type
+                        continue
+                    pairs.append({tkey: tt, vkey: vv})
+        # If only tkey is provided (no vkey), still emit with vkey=None when tt is None
+        if not v_list and any(tt is None for tt in t_list):
+            pairs.append({tkey: None, vkey: None})
+        return pairs or [{tkey: None, vkey: None}]
+
+    # Build paired groups
+    stop_pairs  = group_pairs("stop")
+    tp_pairs    = group_pairs("tp")
+    trail_pairs = group_pairs("trail")
+
+    # Independent keys = everything except the paired key names present
+    paired_keys = set()
+    for pfx in ("stop", "tp", "trail"):
+        for suffix in ("type", "value"):
+            k = f"{pfx}_{suffix}"
+            if k in param_grid:
+                paired_keys.add(k)
+
+    indep_keys = [k for k in param_grid.keys() if k not in paired_keys]
+    indep_vals = [list(param_grid[k]) for k in indep_keys] if indep_keys else [[]]
+
+    # Build product across independent dims and paired groups
+    # Treat each group's pair dict as an atomic unit.
+    from itertools import product
+
+    group_lists: List[List[Dict[str, Any]]] = [
+        gp for gp in (stop_pairs, tp_pairs, trail_pairs) if gp is not None
+    ]
+    if not group_lists:
+        group_lists = [[{}]]  # no paired groups at all
+
+    combos: List[Dict[str, Any]] = []
+    for indep_tuple in (product(*indep_vals) if indep_keys else [()]):
+        base = {k: v for k, v in zip(indep_keys, indep_tuple)} if indep_keys else {}
+        for grouped in product(*group_lists):
+            merged = dict(base)
+            for g in grouped:
+                merged.update(g)
+            combos.append(merged)
     return combos
+
 
 
 def _default_score(metrics: Dict[str, float]) -> float:
