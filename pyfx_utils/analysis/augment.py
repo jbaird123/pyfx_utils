@@ -716,6 +716,11 @@ def _coerce_scalar_type(key: str, val, *, in_params: bool, parent_key: str | Non
         f = float(val)
         return int(f) if f.is_integer() else f
 
+    # tuning.top rows use "param_*" keys — snap integral numerics to int
+    if k.startswith("param_") and _is_number(val):
+        f = float(val)
+        return int(f) if f.is_integer() else f
+    
     # Side totals: force ints (you want whole pips)
     if parent_key == "by_side_total_pips" and _is_number(val):
         return int(round(float(val)))
