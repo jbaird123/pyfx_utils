@@ -7,8 +7,9 @@ from typing import Any, Dict, Sequence, Type, Optional
 
 from ..backtests.signal import BTConfig
 from ..backtests.core import backtest
-from ..utils.stats import cumulative_pips
+from ..utils.stats import cumulative_pips, infer_pip_size
 from .regime import perf_by_regime, perf_by_regime_pips, build_regime_features, kmeans_regimes
+from .interfaces import normalize_side
 
 # Canonical imports 
 from .tuning import (
@@ -261,22 +262,107 @@ def build_pips_brief(payload: StrategyRunPayload) -> Dict[str, Any]:
     return brief
 
 
-def annotate_trades_with_indicators(
+def annotate_trades(
     trades: pd.DataFrame,
-    features: pd.DataFrame,
-    at: str = "entry",
-    cols: Iterable[str] | None = None,
-    suffix: str | None = None,
+    data: pd.DataFrame,
+    *,
+    symbol: str | None = None,
+    pip: float | None = None,
+    price_col: str = "close",
+    feature_cols: tuple[str, ...] | list[str] | None = ("rsi", "adx", "atr", "bb_width"),
+    at: str = "entry",            # "entry" or "exit" for feature snapshot timing
+    strict_features: bool = True, # if True and none of requested features exist -> raise
 ) -> pd.DataFrame:
-    if cols is None:
-        cols = list(features.columns)
-    ts_col = f"{at}_time"
-    key = pd.to_datetime(trades[ts_col])
-    feat = features.copy()
-    feat.index = pd.to_datetime(feat.index)
-    take = feat.reindex(key, method="nearest")
-    add = take[cols].reset_index(drop=True)
-    if suffix:
-        add = add.add_suffix(suffix)
-    out = trades.reset_index(drop=True).join(add)
+    """
+    Add MFE/MAE (in pips) and snapshot selected features at a chosen moment ('entry' or 'exit').
+
+    Requires 'trades' columns: entry_time, exit_time, entry_price, side
+    Requires 'data' to be datetime-indexed with `price_col` and any requested features.
+
+    - MFE (max favorable excursion) and MAE (max adverse excursion) are computed side-aware
+      over the inclusive window [entry_time, exit_time], in pips.
+    - Features are snapped using a time-aware backward join (no look-ahead):
+      the latest known feature values at or before the timestamp specified by `at`.
+
+    Returns the original trades with added columns:
+      - 'mfe_pips', 'mae_pips'
+      - '<feature>@<at>' for each feature in `feature_cols` that exists in `data`
+    """
+    required = {"entry_time", "exit_time", "entry_price", "side"}
+    missing = required - set(trades.columns)
+    if missing:
+        raise ValueError(f"trades is missing required columns: {sorted(missing)}")
+
+    # --- normalize times and data index
+    out = trades.copy()
+    out["entry_time"] = pd.to_datetime(out["entry_time"], errors="coerce")
+    out["exit_time"]  = pd.to_datetime(out["exit_time"],  errors="coerce")
+
+    d = data.copy()
+    if not isinstance(d.index, pd.DatetimeIndex):
+        d.index = pd.to_datetime(d.index, errors="coerce")
+    d = d.sort_index()
+
+    # --- MFE/MAE in pips (side-aware)
+    if pip is None:
+        pip = infer_pip_size(symbol) if symbol is not None else 0.0001
+    pip = float(pip)
+    if pip == 0.0:
+        raise ValueError("pip must be non-zero")
+
+    if price_col not in d.columns:
+        raise KeyError(f"'{price_col}' not found in data columns: {list(d.columns)[:10]} ...")
+
+    px = pd.to_numeric(d[price_col], errors="coerce")
+    side_series = normalize_side(out["side"])
+
+    mfe, mae = [], []
+    for i, r in out.iterrows():
+        t0, t1 = r["entry_time"], r["exit_time"]
+        ep = pd.to_numeric(r["entry_price"], errors="coerce")
+        if pd.isna(t0) or pd.isna(t1) or pd.isna(ep):
+            mfe.append(np.nan); mae.append(np.nan); continue
+
+        w = px.loc[(px.index >= t0) & (px.index <= t1)]
+        if w.empty:
+            mfe.append(np.nan); mae.append(np.nan); continue
+
+        sgn = 1.0 if (str(side_series.loc[i]) == "long") else -1.0
+        signed = (w.values - float(ep)) / pip * sgn
+        mfe.append(float(np.nanmax(signed)))
+        mae.append(float(np.nanmin(signed)))
+
+    out["mfe_pips"] = mfe
+    out["mae_pips"] = mae
+
+    # --- Feature snapshot at `at` ("entry" or "exit"), backward (no look-ahead)
+    if feature_cols:
+        if at not in ("entry", "exit"):
+            raise ValueError("`at` must be 'entry' or 'exit'")
+        feats_present = [c for c in feature_cols if c in d.columns]
+        if not feats_present:
+            if strict_features:
+                raise ValueError(
+                    f"No requested features found. Requested={list(feature_cols)} "
+                    f"Available sample={list(d.columns[:10])}"
+                )
+            # else: just return with MFE/MAE only
+            return out
+
+        ts_col = f"{at}_time"
+        left = out[[ts_col]].copy()
+        left[ts_col] = pd.to_datetime(left[ts_col], errors="coerce")
+        left = left.reset_index(drop=False).sort_values(ts_col)
+
+        right = d[feats_present].reset_index()
+        right.columns = [ts_col] + feats_present
+        right = right.sort_values(ts_col)
+
+        merged = pd.merge_asof(
+            left, right, on=ts_col, direction="backward", allow_exact_matches=True
+        ).sort_values("index")
+
+        snapped = merged[feats_present].add_suffix(f"@{at}").reset_index(drop=True)
+        out = out.reset_index(drop=True).join(snapped)
+
     return out
