@@ -1,4 +1,38 @@
-# Python-specific ignores
+# Bytecode / cache
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+
+# Packaging / builds
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# Test & coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+
+# Environments
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Editors / OS
 .DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
