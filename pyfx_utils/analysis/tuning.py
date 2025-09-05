@@ -4,12 +4,13 @@ from itertools import product
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Type
 import random
 import pandas as pd
+import numpy as np
 import os
 from datetime import datetime
 
 from pyfx_utils.backtests.core import backtest
 from pyfx_utils.utils.stats import cumulative_pips
-import numpy as np
+
 
 def _py_scalar(v):
     # cast numpy scalars -> Python scalars; make 10.0 -> 10
@@ -310,3 +311,242 @@ def load_results(path: str) -> pd.DataFrame:
     else:
         raise ValueError(f"Unsupported file extension: {ext}")
 
+
+# --- Keep the sanitizer we discussed (paste if not present yet) ---
+def sanitize_tuning_block(tuning: dict) -> dict:
+    """Ensure *_value is None whenever the corresponding *_type is None."""
+    if not isinstance(tuning, dict):
+        return tuning
+
+    out = dict(tuning)
+
+    # Fix list of top rows
+    top = out.get("top")
+    if isinstance(top, list):
+        fixed = []
+        for row in top:
+            r = dict(row)
+            if r.get("param_stop_type") is None:
+                r["param_stop_value"] = None
+            if r.get("param_tp_type") is None:
+                r["param_tp_value"] = None
+            fixed.append(r)
+        out["top"] = fixed
+
+    # Fix best_params map
+    bp = out.get("best_params")
+    if isinstance(bp, dict):
+        bp = dict(bp)
+        if bp.get("stop_type") is None:
+            bp["stop_value"] = None
+        if bp.get("tp_type") is None:
+            bp["tp_value"] = None
+        out["best_params"] = bp
+
+    return out
+
+
+# --- Core: run_param_search ----------------------------------------------------
+
+@dataclass
+class ParamSearchResult:
+    """Internal holder for a single parameter combination evaluation."""
+    params: Dict[str, Any]
+    metrics: Dict[str, float]
+    n_trades: int
+    # Optional: keep a pointer if you want (not returned by default)
+    # trades: Optional[pd.DataFrame] = None
+
+
+def _expand_param_grid(param_grid: Dict[str, Iterable[Any]]) -> List[Dict[str, Any]]:
+    """
+    Expand a scikit-like param_grid (each value is an iterable) into a list of
+    concrete parameter dicts. Handles values including None.
+    Example:
+        {"fast": [10, 20], "slow": [50], "stop_type": [None, "atr"], "stop_value": [None, 2]}
+    """
+    keys = list(param_grid.keys())
+    values = [list(v) for v in param_grid.values()]
+    combos = []
+    for tpl in product(*values):
+        p = {k: v for k, v in zip(keys, tpl)}
+        combos.append(p)
+    return combos
+
+
+def _default_score(metrics: Dict[str, float]) -> float:
+    """
+    Ranking score if the caller doesn’t provide one.
+    Priority: higher total pips, then higher mean pips, then less drawdown.
+    """
+    total = metrics.get("total_pips", 0.0)
+    mean_ = metrics.get("mean_pips", 0.0)
+    mdd  = metrics.get("max_dd_pips", 0.0)  # typically negative
+    return (total, mean_, -mdd)  # tuple ordering works with Python sort
+
+
+def run_param_search(
+    *,
+    data: pd.DataFrame,
+    # A callable that, given (data, params), returns a trades DataFrame
+    # with at least a float "pips" column; times optional but helpful.
+    strategy_runner: Callable[[pd.DataFrame, Dict[str, Any]], pd.DataFrame],
+    # Dict[str, Iterable] just like sklearn's GridSearchCV param_grid
+    param_grid: Dict[str, Iterable[Any]],
+    # Optional scoring function that maps the per-combo metrics -> sortable key
+    score_fn: Optional[Callable[[Dict[str, float]], Any]] = None,
+    # Limit the number of top rows kept
+    top_n: int = 20,
+    # When True, keeps only metric columns + params in "top"
+    include_extra_cols: bool = False,
+) -> Dict[str, Any]:
+    """
+    Run a simple, robust grid search over a strategy's parameter space.
+
+    Parameters
+    ----------
+    data : DataFrame
+        OHLC(V) price data used by `strategy_runner`.
+    strategy_runner : Callable
+        Function that executes the strategy and returns a trades ledger (DataFrame)
+        with a 'pips' column. E.g. `lambda df, p: run_sma(df, p)`.
+    param_grid : dict[str, Iterable]
+        Dict mapping param name -> iterable of values (including None allowed).
+    score_fn : Callable(metrics) -> sort key
+        Optional ranking function. Defaults to a reasonable pip-centric tuple.
+    top_n : int
+        Keep this many best rows in the "top" list.
+    include_extra_cols : bool
+        If True, include additional computed columns in each top row.
+
+    Returns
+    -------
+    tuning : dict
+        {
+          "searched_params": {...},     # the grid you searched
+          "n_evals": int,
+          "top": [ { "param_*": ..., metrics... }, ... ],   # up to top_n best
+          "best_params": {...},         # the parameters of the best row
+          "best_metrics": {...}         # metrics of the best row
+        }
+        (Sanitized so *_value is None when *_type is None.)
+    """
+    score_fn = score_fn or _default_score
+    combos = _expand_param_grid(param_grid)
+
+    rows: List[ParamSearchResult] = []
+
+    for params in combos:
+        try:
+            trades = strategy_runner(data, params)
+
+            # Basic checks
+            if trades is None or not isinstance(trades, pd.DataFrame) or "pips" not in trades.columns:
+                # Treat as zero-result
+                metrics = {
+                    "n_trades": 0, "total_pips": 0.0, "mean_pips": 0.0,
+                    "median_pips": 0.0, "max_dd_pips": 0.0, "win_rate": 0.0
+                }
+                rows.append(ParamSearchResult(params=params, metrics=metrics, n_trades=0))
+                continue
+
+            t = trades.copy()
+            t["pips"] = pd.to_numeric(t["pips"], errors="coerce")
+            t = t.dropna(subset=["pips"])
+
+            n_tr = int(len(t))
+            total = float(t["pips"].sum()) if n_tr else 0.0
+            mean_ = float(t["pips"].mean()) if n_tr else 0.0
+            median_ = float(t["pips"].median()) if n_tr else 0.0
+
+            # trade-sequence MDD in pips (no time needed)
+            cp = t["pips"].cumsum()
+            dd = cp - cp.cummax()
+            mdd = float(dd.min()) if len(dd) else 0.0
+
+            wins = (t["pips"] > 0)
+            win_rate = float(wins.mean()) if n_tr else 0.0
+
+            metrics = {
+                "n_trades": n_tr,
+                "total_pips": total,
+                "mean_pips": mean_,
+                "median_pips": median_,
+                "max_dd_pips": mdd,
+                "win_rate": win_rate,
+            }
+
+            rows.append(ParamSearchResult(params=params, metrics=metrics, n_trades=n_tr))
+        except Exception:
+            # Fail-soft: count as a zero row; keep search robust
+            metrics = {
+                "n_trades": 0, "total_pips": 0.0, "mean_pips": 0.0,
+                "median_pips": 0.0, "max_dd_pips": 0.0, "win_rate": 0.0
+            }
+            rows.append(ParamSearchResult(params=params, metrics=metrics, n_trades=0))
+
+    # Build a DataFrame to sort and select top rows
+    recs = []
+    for r in rows:
+        rec: Dict[str, Any] = {}
+        # Flatten params into "param_*" columns, mirroring sklearn style
+        for k, v in r.params.items():
+            rec[f"param_{k}"] = v
+        rec.update(r.metrics)
+        # Optional derived score (not kept unless include_extra_cols=True)
+        rec["_score"] = score_fn(r.metrics)
+        recs.append(rec)
+
+    if len(recs) == 0:
+        tuning = {
+            "searched_params": {k: list(v) for k, v in param_grid.items()},
+            "n_evals": 0,
+            "top": [],
+            "best_params": {},
+            "best_metrics": {},
+        }
+        return sanitize_tuning_block(tuning)
+
+    df = pd.DataFrame(recs)
+
+    # Sort by our score (tuple works), descending (best first)
+    # Pandas can't sort by arbitrary python tuples directly, so map to rank key
+    # Build a rank array by applying score_fn again (cheap)
+    sort_keys = df.apply(lambda row: score_fn({
+        "total_pips": row.get("total_pips", 0.0),
+        "mean_pips": row.get("mean_pips", 0.0),
+        "max_dd_pips": row.get("max_dd_pips", 0.0),
+        "n_trades": row.get("n_trades", 0),
+        "win_rate": row.get("win_rate", 0.0),
+    }), axis=1)
+
+    # Convert sort_keys (tuples) into a DataFrame to sort by multiple columns
+    # This supports the default triple (total, mean, -mdd)
+    sort_cols = pd.DataFrame(sort_keys.tolist(), index=df.index)
+    # Default: larger is better for col0, col1; for col2 we already flipped sign
+    order = [False] * sort_cols.shape[1]  # descending
+    df = df.join(sort_cols.rename(columns=lambda i: f"_k{i+1}"))
+    df = df.sort_values(by=[c for c in df.columns if c.startswith("_k")], ascending=order)
+
+    # Build "top" rows
+    cols = [c for c in df.columns if c.startswith("param_")] + [
+        "n_trades", "total_pips", "mean_pips", "median_pips", "max_dd_pips", "win_rate"
+    ]
+    if include_extra_cols:
+        cols = cols + [c for c in df.columns if c.startswith("_k")] + (["_score"] if "_score" in df.columns else [])
+
+    top_rows = df[cols].head(int(top_n)).to_dict(orient="records")
+
+    # Best row
+    best = top_rows[0] if len(top_rows) else {}
+    best_params = {k.replace("param_", ""): v for k, v in best.items() if k.startswith("param_")}
+    best_metrics = {k: best[k] for k in ("n_trades", "total_pips", "mean_pips", "median_pips", "max_dd_pips", "win_rate") if k in best}
+
+    tuning = {
+        "searched_params": {k: list(v) for k, v in param_grid.items()},
+        "n_evals": int(len(df)),
+        "top": top_rows,
+        "best_params": best_params,
+        "best_metrics": best_metrics,
+    }
+    return sanitize_tuning_block(tuning)
