@@ -5,12 +5,13 @@ import pandas as pd
 import numpy as np
 
 from typing import Any, Dict, Sequence, Type, Optional
+from dataclasses import asdict
 
 from ..backtests.signal import BTConfig
 from ..backtests.core import backtest
 from ..utils.stats import cumulative_pips, infer_pip_size
 from .regime import perf_by_regime, perf_by_regime_pips, build_regime_features, kmeans_regimes
-from .interfaces import normalize_side
+from .interfaces import normalize_side, StrategyRunPayload, validate_trades, OPTIONAL_TRADE_COLS
 
 # Canonical imports 
 from .tuning import (
@@ -174,7 +175,7 @@ def extend_brief_with_analyses(
           trades = backtest(df, strat, pip=pip)
 
           # Build per-bar pips series from trades, then per-bar pips increments
-          pips_curve = cumulative_pips_series(trades, df.index, when=when)  # cumulative pips
+          pips_curve = cumulative_pips(trades, df.index, when=when)  # cumulative pips
           pips_per_bar = pips_curve.diff().fillna(0.0)                      # per-bar pips increments
 
           # Performance by regime (pips)
@@ -226,7 +227,11 @@ def build_pips_brief(payload: StrategyRunPayload) -> Dict[str, Any]:
     }
 
     # Include any indicator snapshot columns that happen to be present
-    snapshot_cols = [c for c in OPTIONAL_TRADE_COLS if c in t.columns]
+    snapshot_cols = (
+        [c for c in OPTIONAL_TRADE_COLS if c in t.columns]
+        if OPTIONAL_TRADE_COLS
+        else [c for c in t.columns if c.endswith("@entry") or c.endswith("@exit")]
+    )
 
     # Keep small sample for token control
     base_cols = ["entry_time", "exit_time", "side", "pips"]
@@ -246,7 +251,7 @@ def build_pips_brief(payload: StrategyRunPayload) -> Dict[str, Any]:
     # Optional: include a tiny spark of the cumulative curve if bar_index is given
     if payload.bar_index is not None and len(payload.bar_index) > 0:
         try:
-            cum = cumulative_pips_series(t, payload.bar_index, when="exit")
+            cum = cumulative_pips(t, payload.bar_index, when="exit")
             # compress: take ~50 evenly spaced points to control tokens
             if len(cum) > 50:
                 idx = (pd.Series(range(len(cum))) * (len(cum) - 1) / 49).round().astype(int).unique()
