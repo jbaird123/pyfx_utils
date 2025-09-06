@@ -71,29 +71,41 @@ def backtest(data: pd.DataFrame, strategy: StrategyProtocol, pip: float) -> pd.D
     """
     df = data.copy()
     sig = strategy.generate_signals(df)
-    required = ["entry_long","entry_short","exit_long","exit_short"]
-    sig = sig.reindex(df.index)
-    for c in required:
-        sig[c] = sig[c].fillna(False).astype(bool)
 
-    # Optional: edge-trigger entries
+    # --- Require & align
+    required = ["entry_long", "entry_short", "exit_long", "exit_short"]
+    missing = [c for c in required if c not in sig.columns]
+    if missing:
+        raise KeyError(f"generate_signals() missing columns: {missing}")
+    sig = sig.reindex(df.index)  # align to price index
+
+    # --- Strongly coerce to real booleans BEFORE edge-triggering (avoids FutureWarning)
+    TRUE_STR = {"1", "true", "t", "yes", "y"}
+    for c in required:
+        col = sig[c].infer_objects(copy=False)
+        if pd.api.types.is_bool_dtype(col):
+            b = col.fillna(False)
+        elif pd.api.types.is_numeric_dtype(col):
+            b = (col.fillna(0) != 0)
+        else:
+            b = col.fillna("").astype(str).str.strip().str.lower().isin(TRUE_STR)
+        sig[c] = b.astype(bool)
+
+    # --- Edge-trigger entries (convert “level stays true” into “flip to true”)
     sig["entry_long"]  = sig["entry_long"]  & ~sig["entry_long"].shift(1).fillna(False)
     sig["entry_short"] = sig["entry_short"] & ~sig["entry_short"].shift(1).fillna(False)
 
-    overlap_entries = (sig["entry_long"] & sig["entry_short"]).sum()
-    if overlap_entries:
-        raise ValueError(f"{overlap_entries} bars have BOTH entry_long and entry_short True.")
+    # --- Forbid overlapping entries (or resolve by policy if you prefer)
+    overlap = (sig["entry_long"] & sig["entry_short"]).sum()
+    if overlap:
+        raise ValueError(f"{overlap} bars have BOTH entry_long and entry_short True. Fix signal rules.")
 
+    # --- Final numpy arrays (once — DO NOT rebuild again)
     el = sig["entry_long"].to_numpy()
     es = sig["entry_short"].to_numpy()
     xl = sig["exit_long"].to_numpy()
     xs = sig["exit_short"].to_numpy()
 
-    # Arrays for speed/clarity
-    el = sig["entry_long"].to_numpy(bool)
-    es = sig["entry_short"].to_numpy(bool)
-    xl = sig["exit_long"].to_numpy(bool)
-    xs = sig["exit_short"].to_numpy(bool)
 
     close = df["close"].astype(float).to_numpy()
     high  = df["high"].astype(float).to_numpy() if "high" in df else close
