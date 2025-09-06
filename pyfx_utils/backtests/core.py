@@ -91,20 +91,23 @@ def backtest(data: pd.DataFrame, strategy: StrategyProtocol, pip: float) -> pd.D
             b = col.fillna("").astype(str).str.strip().str.lower().isin(TRUE_STR)
         sig[c] = b.astype(bool)
 
-    # --- Edge-trigger entries (convert “level stays true” into “flip to true”)
-    sig["entry_long"]  = sig["entry_long"]  & ~sig["entry_long"].shift(1).fillna(False)
-    sig["entry_short"] = sig["entry_short"] & ~sig["entry_short"].shift(1).fillna(False)
+    # --- Build clean boolean *levels* (we assume you already coerced dtype above)
+    el_level = sig["entry_long"].fillna(False).to_numpy(dtype=bool)
+    es_level = sig["entry_short"].fillna(False).to_numpy(dtype=bool)
+    xl       = sig["exit_long"].fillna(False).to_numpy(dtype=bool)
+    xs       = sig["exit_short"].fillna(False).to_numpy(dtype=bool)
 
-    # --- Forbid overlapping entries (or resolve by policy if you prefer)
-    overlap = (sig["entry_long"] & sig["entry_short"]).sum()
-    if overlap:
-        raise ValueError(f"{overlap} bars have BOTH entry_long and entry_short True. Fix signal rules.")
+    # --- Edge-trigger entries via NumPy (no pandas shift/fillna -> no FutureWarning)
+    # edge = True where current bar is True and previous bar was False
+    el = el_level & ~np.r_[False, el_level[:-1]]
+    es = es_level & ~np.r_[False, es_level[:-1]]
 
-    # --- Final numpy arrays (once — DO NOT rebuild again)
-    el = sig["entry_long"].to_numpy()
-    es = sig["entry_short"].to_numpy()
-    xl = sig["exit_long"].to_numpy()
-    xs = sig["exit_short"].to_numpy()
+    # --- Overlap handling on edges (deterministic policy)
+    # Prefer LONG when both edges are True on the same bar; clear short edge
+    both = el & es
+    if both.any():
+        es[both] = False
+
 
 
     close = df["close"].astype(float).to_numpy()
@@ -212,7 +215,11 @@ def backtest(data: pd.DataFrame, strategy: StrategyProtocol, pip: float) -> pd.D
             # Signal exits if no protective exit hit
             if (state == 1 and xl[i]) or (state == -1 and xs[i]):
                 close_trade(i, close[i])
-                continue
+                # IMPORTANT: do NOT continue.
+                # Fall through to the "Entries when flat" block below so we can flip on the SAME bar.
+                # (Protective exits above still 'continue'—only signal exits flip always-in.)
+                # no 'continue' here
+
 
         # 3) Entries when flat
         if state == 0:
