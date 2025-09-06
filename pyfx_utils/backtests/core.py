@@ -71,6 +71,23 @@ def backtest(data: pd.DataFrame, strategy: StrategyProtocol, pip: float) -> pd.D
     """
     df = data.copy()
     sig = strategy.generate_signals(df)
+    required = ["entry_long","entry_short","exit_long","exit_short"]
+    sig = sig.reindex(df.index)
+    for c in required:
+        sig[c] = sig[c].fillna(False).astype(bool)
+
+    # Optional: edge-trigger entries
+    sig["entry_long"]  = sig["entry_long"]  & ~sig["entry_long"].shift(1).fillna(False)
+    sig["entry_short"] = sig["entry_short"] & ~sig["entry_short"].shift(1).fillna(False)
+
+    overlap_entries = (sig["entry_long"] & sig["entry_short"]).sum()
+    if overlap_entries:
+        raise ValueError(f"{overlap_entries} bars have BOTH entry_long and entry_short True.")
+
+    el = sig["entry_long"].to_numpy()
+    es = sig["entry_short"].to_numpy()
+    xl = sig["exit_long"].to_numpy()
+    xs = sig["exit_short"].to_numpy()
 
     # Arrays for speed/clarity
     el = sig["entry_long"].to_numpy(bool)
