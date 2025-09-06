@@ -340,8 +340,9 @@ def _round_value_for_brief(key, val):
         return int(round(float(val)))
 
     # rates/coverage
-    if k == "win_rate":
-        return round(f, 3)
+    if k in {"win_rate", "prob_neg_total"}:
+        return round(float(val), 3)
+
     if k.endswith("coverage"):
         return round(f, 3)
 
