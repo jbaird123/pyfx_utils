@@ -1,0 +1,259 @@
+import numpy as np
+import pandas as pd
+from typing import Protocol,Optional
+
+class StrategyProtocol(Protocol):
+    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame: ...
+    # Optional attrs read by execution:
+    # stop_type: 'pips'|'atr'|None
+    # stop_value: float|None
+    # tp_type: 'pips'|'atr'|None
+    # tp_value: float|None
+    # trail_type: 'pips'|'atr'|None
+    # trail_value: float|None
+    # trail_mode: 'chandelier'|'close_based'
+    # atr_length: int
+    # tie_break: 'stop_then_tp'|'tp_then_stop'
+
+def _atr_wilder(df: pd.DataFrame, n: int) -> pd.Series:
+    """Wilder's ATR in price units (requires high/low/close)."""
+    high = df["high"].astype(float).to_numpy()
+    low  = df["low"].astype(float).to_numpy()
+    close = df["close"].astype(float).to_numpy()
+    prev_close = np.roll(close, 1); prev_close[0] = close[0]
+    tr = np.maximum.reduce([
+        np.abs(high - low),
+        np.abs(high - prev_close),
+        np.abs(low  - prev_close)
+    ])
+    atr = pd.Series(tr).ewm(alpha=1.0/float(n), adjust=False).mean()
+    return pd.Series(atr, index=df.index)
+
+def _fixed_price_from_dist(side: int, entry_price: float, dist_price: float, is_stop: bool) -> float:
+    """Convert a signed distance in *price units* into an absolute stop/tp price."""
+    if side == 1:   # long
+        return entry_price - dist_price if is_stop else entry_price + dist_price
+    else:           # short
+        return entry_price + dist_price if is_stop else entry_price - dist_price
+
+def _dist_price(
+    side: int,
+    kind: Optional[str],
+    value: Optional[float],
+    pip: float,
+    atr_val: Optional[float],
+) -> float:   # may return np.nan
+    """
+    Return a positive distance in *price units* for the chosen kind:
+      - 'pips':  value * pip
+      - 'atr':   value * atr_val
+      - None:    np.nan
+    """
+    if kind is None or value is None:
+        return np.nan
+    if kind == "pips":
+        return float(value) * float(pip)
+    if kind == "atr":
+        if atr_val is None or np.isnan(atr_val):
+            return np.nan
+        return float(value) * float(atr_val)
+    # unknown kind → disabled
+    return np.nan
+
+def backtest(data: pd.DataFrame, strategy: StrategyProtocol, pip: float) -> pd.DataFrame:
+    """
+    Single-position engine (flat → long/short → flat) with:
+      - Fixed stop/TP: distance in pips or ATR multiples
+      - Trailing stop: pips or ATR; 'chandelier' (since-entry H/L) or 'close_based'
+      - Intrabar check using H/L; tie-break when both stop & TP are plausible
+      - Signal-based exits at close when no protective exits hit
+    Returns columns: side, entry_time, entry_price, exit_time, exit_price, pips
+    """
+    df = data.copy()
+    sig = strategy.generate_signals(df)
+
+    # --- Require & align
+    required = ["entry_long", "entry_short", "exit_long", "exit_short"]
+    missing = [c for c in required if c not in sig.columns]
+    if missing:
+        raise KeyError(f"generate_signals() missing columns: {missing}")
+    sig = sig.reindex(df.index)  # align to price index
+
+    # --- Strongly coerce to real booleans BEFORE edge-triggering (avoids FutureWarning)
+    TRUE_STR = {"1", "true", "t", "yes", "y"}
+    for c in required:
+        col = sig[c].infer_objects(copy=False)
+        if pd.api.types.is_bool_dtype(col):
+            b = col.fillna(False)
+        elif pd.api.types.is_numeric_dtype(col):
+            b = (col.fillna(0) != 0)
+        else:
+            b = col.fillna("").astype(str).str.strip().str.lower().isin(TRUE_STR)
+        sig[c] = b.astype(bool)
+
+    # --- Build clean boolean *levels* (we assume you already coerced dtype above)
+    el_level = sig["entry_long"].fillna(False).to_numpy(dtype=bool)
+    es_level = sig["entry_short"].fillna(False).to_numpy(dtype=bool)
+    xl       = sig["exit_long"].fillna(False).to_numpy(dtype=bool)
+    xs       = sig["exit_short"].fillna(False).to_numpy(dtype=bool)
+
+    # --- Edge-trigger entries via NumPy (no pandas shift/fillna -> no FutureWarning)
+    # edge = True where current bar is True and previous bar was False
+    el = el_level & ~np.r_[False, el_level[:-1]]
+    es = es_level & ~np.r_[False, es_level[:-1]]
+
+    # --- Overlap handling on edges (deterministic policy)
+    # Prefer LONG when both edges are True on the same bar; clear short edge
+    both = el & es
+    if both.any():
+        es[both] = False
+
+
+
+    close = df["close"].astype(float).to_numpy()
+    high  = df["high"].astype(float).to_numpy() if "high" in df else close
+    low   = df["low"].astype(float).to_numpy()  if "low"  in df else close
+    idx   = df.index.to_numpy()
+
+    # Execution params
+    stop_type   = getattr(strategy, "stop_type", None)
+    stop_value  = getattr(strategy, "stop_value", None)
+    tp_type     = getattr(strategy, "tp_type", None)
+    tp_value    = getattr(strategy, "tp_value", None)
+    trail_type  = getattr(strategy, "trail_type", None)
+    trail_value = getattr(strategy, "trail_value", None)
+    trail_mode  = str(getattr(strategy, "trail_mode", "chandelier"))
+    tie_break   = str(getattr(strategy, "tie_break", "stop_then_tp"))
+    atr_len     = int(getattr(strategy, "atr_length", 14))
+
+    use_stop  = (stop_type is not None and stop_value is not None)
+    use_tp    = (tp_type   is not None and tp_value   is not None)
+    use_trail = (trail_type is not None and trail_value is not None)
+
+    if (use_stop or use_tp or use_trail) and not {"high","low","close"}.issubset(df.columns):
+        raise ValueError("Protective exits require high/low/close columns.")
+
+    atr = _atr_wilder(df, atr_len).to_numpy() if ((stop_type == "atr") or (tp_type == "atr") or (trail_type == "atr")) else None
+
+    # State
+    state = 0       # 0=flat, 1=long, -1=short
+    ei = -1
+    ep = np.nan
+    stop_px = np.nan       # fixed stop from entry
+    tp_px   = np.nan       # fixed tp from entry
+    trail_px = np.nan      # trailing stop
+    hh_since_entry = -np.inf
+    ll_since_entry =  np.inf
+    out = []
+
+    def close_trade(exit_i: int, price: float):
+        nonlocal state, ei, ep, stop_px, tp_px, trail_px, hh_since_entry, ll_since_entry
+        side = "long" if state == 1 else "short"
+        pips_val = (price - ep)/pip if state == 1 else (ep - price)/pip
+        out.append({
+            "side": side,
+            "entry_time": pd.Timestamp(idx[ei]),
+            "entry_price": float(ep),
+            "exit_time": pd.Timestamp(idx[exit_i]),
+            "exit_price": float(price),
+            "pips": float(pips_val),
+        })
+        state = 0
+        ei = -1
+        ep = stop_px = tp_px = trail_px = np.nan
+        hh_since_entry = -np.inf
+        ll_since_entry =  np.inf
+
+    n = len(df)
+    for i in range(n):
+        # 1) Update trailing stop if in a position
+        if state != 0 and use_trail:
+            base_dist = _dist_price(state, trail_type, trail_value, pip, atr[i] if atr is not None else None)
+            if not np.isnan(base_dist):
+                if trail_mode == "chandelier":
+                    if state == 1:  # long
+                        hh_since_entry = max(hh_since_entry, high[i])
+                        candidate = hh_since_entry - base_dist
+                    else:           # short
+                        ll_since_entry = min(ll_since_entry, low[i])
+                        candidate = ll_since_entry + base_dist
+                else:  # 'close_based'
+                    candidate = (close[i] - base_dist) if state == 1 else (close[i] + base_dist)
+                # Never loosen the trailing stop (tighten only)
+                if np.isnan(trail_px):
+                    trail_px = candidate
+                else:
+                    if state == 1:
+                        trail_px = max(trail_px, candidate)
+                    else:
+                        trail_px = min(trail_px, candidate)
+
+        # 2) Exits first when in a position
+        if state != 0:
+            # Effective stop = tightest of fixed stop and trailing stop
+            eff_stop = np.nan
+            if state == 1:   # long
+                candidates = [x for x in (stop_px, trail_px) if not np.isnan(x)]
+                eff_stop = max(candidates) if candidates else np.nan
+                hit_stop = (not np.isnan(eff_stop)) and (low[i] <= eff_stop)
+                hit_tp   = (not np.isnan(tp_px))     and (high[i] >= tp_px)
+            else:            # short
+                candidates = [x for x in (stop_px, trail_px) if not np.isnan(x)]
+                eff_stop = min(candidates) if candidates else np.nan
+                hit_stop = (not np.isnan(eff_stop)) and (high[i] >= eff_stop)
+                hit_tp   = (not np.isnan(tp_px))     and (low[i]  <= tp_px)
+
+            if hit_stop or hit_tp:
+                # deterministic tie-break
+                if tie_break == "stop_then_tp":
+                    price = eff_stop if hit_stop else tp_px
+                else:  # 'tp_then_stop'
+                    price = tp_px if hit_tp else eff_stop
+                close_trade(i, float(price))
+                continue
+
+            # Signal exits if no protective exit hit
+            if (state == 1 and xl[i]) or (state == -1 and xs[i]):
+                close_trade(i, close[i])
+                # IMPORTANT: do NOT continue.
+                # Fall through to the "Entries when flat" block below so we can flip on the SAME bar.
+                # (Protective exits above still 'continue'—only signal exits flip always-in.)
+                # no 'continue' here
+
+
+        # 3) Entries when flat
+        if state == 0:
+            if el[i] or es[i]:
+                state = 1 if el[i] else -1
+                ei = i
+                ep = close[i]
+                # initialize since-entry extremes
+                hh_since_entry = high[i]
+                ll_since_entry = low[i]
+                trail_px = np.nan
+
+                # Fixed stop/tp at entry (if configured)
+                dist_stop = _dist_price(state, stop_type, stop_value, pip, atr[i] if atr is not None else None)
+                dist_tp   = _dist_price(state, tp_type,   tp_value,   pip, atr[i] if atr is not None else None)
+                stop_px = _fixed_price_from_dist(state, ep, dist_stop, is_stop=True)  if not np.isnan(dist_stop) else np.nan
+                tp_px   = _fixed_price_from_dist(state, ep, dist_tp,   is_stop=False) if not np.isnan(dist_tp)   else np.nan
+
+    return pd.DataFrame(out, columns=["side","entry_time","entry_price","exit_time","exit_price","pips"])
+
+def trade_pnls(pnl: pd.Series, sig: pd.Series) -> list[float]:
+    tp = []
+    run = 0.0
+    had_pos = False
+    for r, s in zip(pnl.values, sig.values):
+        if s != 0:
+            run += r
+            had_pos = True
+        else:
+            if had_pos:
+                tp.append(run)
+                run = 0.0
+                had_pos = False
+    if had_pos:
+        tp.append(run)
+    return tp
+

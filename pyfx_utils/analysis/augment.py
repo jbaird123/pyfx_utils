@@ -1,0 +1,815 @@
+from __future__ import annotations
+import inspect
+import math
+import pandas as pd
+import numpy as np
+import datetime as dt
+
+from typing import Any, Dict, Sequence, Type, Optional
+from dataclasses import asdict
+
+from ..backtests.signal import BTConfig
+from ..backtests.core import backtest
+from ..utils.stats import cumulative_pips, infer_pip_size, monte_carlo_summary
+from .regime import perf_by_regime, perf_by_regime_pips, build_regime_features, kmeans_regimes
+from .interfaces import normalize_side, StrategyRunPayload, validate_trades, OPTIONAL_TRADE_COLS
+from .walkforward import summarize_walk_forward
+
+# Canonical imports 
+from .tuning import (
+    grid_search,
+    random_search,
+    walk_forward,
+    top_k,
+    best_params,
+    ObjectiveFn,
+    obj_total_pips,
+    _py_scalar
+)
+
+def adf_test(series: pd.Series, autolag: str = "AIC") -> Dict[str, Any]:
+    """
+    Augmented Dickey–Fuller test (optional dependency).
+    Returns a dict with keys: available, statistic, pvalue, lags, nobs, critical_1%, critical_5%, critical_10%, icbest.
+    If statsmodels isn't available or data is too short, returns {'available': False, 'error': '...'}.
+    """
+    try:
+        # Lazy import so the rest of the package doesn't require statsmodels
+        from statsmodels.tsa.stattools import adfuller  # type: ignore
+    except Exception as e:
+        return {"available": False, "error": f"statsmodels not available: {e}"}
+
+    s = pd.Series(series).dropna().astype(float)
+    if len(s) < 20:
+        return {"available": False, "error": "too few points for ADF (need >= 20)"}
+
+    try:
+        stat, pval, lags, nobs, crit, icbest = adfuller(s, autolag=autolag)
+        return {
+            "available": True,
+            "statistic": float(stat),
+            "pvalue": float(pval),
+            "lags": int(lags),
+            "nobs": int(nobs),
+            "critical_1%": float(crit.get("1%")),
+            "critical_5%": float(crit.get("5%")),
+            "critical_10%": float(crit.get("10%")),
+            "icbest": float(icbest),
+        }
+    except Exception as e:
+        return {"available": False, "error": str(e)}
+
+
+def _grid_size(space: Dict[str, Sequence[Any]]) -> Optional[int]:
+    """
+    Compute the total number of grid combinations if space values are finite sequences.
+    Returns None if any dimension is not a finite sized sequence.
+    """
+    try:
+        total = 1
+        for v in space.values():
+            # Treat strings as atomic (len would count characters)
+            if isinstance(v, str):
+                return None
+            n = len(v)  # may raise if not sized
+            if n <= 0:
+                return None
+            total *= n
+            if total > 1_000_000:  # guard against runaway sizes
+                return None
+        return total
+    except Exception:
+        return None
+
+
+def extend_brief_with_analyses(
+    df: pd.DataFrame,
+    strategy_cls: Type,                       # e.g., SMACrossoverStrategy
+    params_space: Dict[str, Sequence[Any]],   # grid or candidate sequences
+    pip: float,
+    *,
+    when: str = "exit",
+    n_splits: int = 4,
+    n_trials: int = 80,
+    objective: ObjectiveFn = obj_total_pips,
+) -> Dict[str, Any]:
+    """
+    Produce additional analysis artifacts to merge into your AI brief:
+      - Parameter search (grid if feasible, otherwise random sampling)
+      - Walk-forward (auto-tune on each train fold -> evaluate next fold)
+      - Stationarity (ADF) on close and on simple returns
+      - Regime analysis: k-means regimes over features + performance by regime
+
+    Returns a dict with keys:
+      {
+        'param_search': {'top': [...], 'best_params': {...}},
+        'walk_forward': [...],
+        'stationarity': {'close': {...}, 'returns': {...}},
+        'regimes': <dict or {'error': '...'}>
+      }
+    """
+    # ---------------------------
+    # 1) Parameter search
+    # ---------------------------
+    # Decide grid vs random: if total grid size is reasonable, run full grid; else random
+    total_grid = _grid_size(params_space)
+    if total_grid is not None and total_grid <= 1_000:
+        gs = grid_search(
+            df=df,
+            strategy_cls=strategy_cls,
+            param_grid=params_space,
+            pip=pip,
+            objective=objective,
+            when=when,
+        )
+    else:
+        gs = random_search(
+            df=df,
+            strategy_cls=strategy_cls,
+            param_grid=params_space,
+            pip=pip,
+            n_trials=n_trials,
+            objective=objective,
+            when=when,
+        )
+
+    top_records = top_k(gs, k=min(5, len(gs))).to_dict(orient="records")
+    top = [{k: _py_scalar(v) for k, v in rec.items()} for rec in top_records]
+    best = best_params(gs) if len(gs) else {}
+
+    # ---------------------------
+    # 2) Walk-forward
+    # ---------------------------
+    wf = walk_forward(
+        df=df,
+        strategy_cls=strategy_cls,
+        param_grid=params_space,
+        pip=pip,
+        objective=objective,
+        n_splits=n_splits,
+        when=when,
+    )
+    wf_rows = wf.to_dict(orient="records") if hasattr(wf, "to_dict") else []
+    for rec in wf_rows:
+      if isinstance(rec.get("params"), dict):
+        rec["params"] = {k: _py_scalar(v) for k, v in rec["params"].items()}
+    
+    # Now add the walk_forward summary here
+    wf_summary = summarize_walk_forward(wf_rows) if wf_rows else {}
+
+    # ---------------------------
+    # 3) Stationarity
+    # ---------------------------
+    st_close = adf_test(df["close"])
+    # Simple close-to-close returns; user can customize to log returns externally
+    ret = df["close"].pct_change()
+    st_ret = adf_test(ret)
+
+    # ---------------------------
+    # 4) Regimes + performance by regime
+    # ---------------------------
+    regimes_block: Dict[str, Any]
+    try:
+      feats = build_regime_features(df)
+      labs = kmeans_regimes(feats, k=3)   # returns pd.Series or None
+      if labs is None:
+          regimes_block = {"available": False, "error": "kmeans unavailable (scikit-learn missing?)"}
+      else:
+          # Backtest with best params (if any) to get trades
+          strat = strategy_cls(**best) if best else strategy_cls()
+          trades = backtest(df, strat, pip=pip)
+
+          # Build per-bar pips series from trades, then per-bar pips increments
+          pips_curve = cumulative_pips(trades, df.index, when=when)  # cumulative pips
+          pips_per_bar = pips_curve.diff().fillna(0.0)                      # per-bar pips increments
+
+          # Performance by regime (pips)
+          from .regime import perf_by_regime_pips
+          perf_r = perf_by_regime_pips(pips_per_bar, labs)
+
+          regimes_block = {
+              "available": True,
+              "k": 3,
+              "performance_by_regime_pips": perf_r.to_dict(orient="records"),
+          }
+    except Exception as e:
+      regimes_block = {"available": False, "error": str(e)}
+    
+    obj_name = getattr(objective, "__name__", type(objective).__name__)
+    obj_doc  = (inspect.getdoc(objective) or "").strip()
+    objective_meta = {"name": obj_name, "doc": obj_doc}
+
+    return {
+        "objective": objective_meta,
+        "param_search": {"top": top, "best_params": best},
+        "walk_forward": wf_rows,
+        "walk_forward_summary": wf_summary,
+        "stationarity": {"close": st_close, "returns": st_ret},
+        "regimes": regimes_block,
+    }
+# -----------------------------
+# Brief builder (pips-only)
+# -----------------------------
+def _risk_snapshot(t):
+    if len(t) == 0:
+        return {}
+    wins = t["pips"] > 0
+    loss = t["pips"] <= 0
+    return {
+        "win_rate": float(wins.mean()),
+        "avg_win": float(t.loc[wins, "pips"].mean()) if wins.any() else 0.0,
+        "avg_loss": float(t.loc[loss, "pips"].mean()) if loss.any() else 0.0,
+        "max_win": float(t["pips"].max()),
+        "max_loss": float(t["pips"].min()),
+    }
+
+
+def _nan_to_none(x):
+    import math, pandas as pd
+    # Scalars only — pass arrays/lists back unchanged
+    if isinstance(x, (list, tuple, pd.Series, pd.Index, np.ndarray)):
+        return x
+    if isinstance(x, float) and math.isnan(x):
+        return None
+    if pd.isna(x):  # catches NaT, pd.NA, etc. (scalar only here)
+        return None
+    return x
+
+
+
+def _to_jsonable(x):
+    # None and plain strings pass through
+    if x is None or isinstance(x, str):
+        return x
+
+    # Pandas datetime-like
+    if isinstance(x, pd.Timestamp):
+        return x.isoformat()
+    if isinstance(x, pd.Timedelta):
+        # choose a stable scalar; seconds works well for briefs
+        return float(x.total_seconds())
+
+    # Python datetime/date
+    if isinstance(x, dt.datetime):
+        return x.isoformat()
+    if isinstance(x, dt.date):
+        return x.isoformat()
+
+    # NumPy scalars
+    if isinstance(x, np.integer):
+        return int(x)
+    if isinstance(x, np.floating):
+        f = float(x)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
+
+    # Plain floats/ints
+    if isinstance(x, float):
+        if math.isnan(x) or math.isinf(x):
+            return None
+        return x
+    if isinstance(x, int) or isinstance(x, bool):
+        return x
+
+    # Containers: recurse
+    if isinstance(x, dict):
+        return {str(k): _to_jsonable(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_to_jsonable(v) for v in x]
+    if isinstance(x, (pd.Series, pd.Index, np.ndarray)):
+        return [_to_jsonable(v) for v in list(x)]
+
+    # Fallback: let json handle (or stringify if you prefer)
+    return x
+
+def _jsonify(obj):
+    """
+    Convert an arbitrary structure (dict/list/scalars) into JSON-serializable
+    Python objects, normalizing NaN/NaT/inf and pandas/numpy types.
+    """
+    return _to_jsonable(obj)
+
+
+def _round_value_for_brief(key, val):
+    """
+    Rounding policy for the brief:
+      - Any key containing 'pips' -> int
+      - 'win_rate' -> 3 decimals (fraction 0..1)
+      - coverage ratios (keys ending with 'coverage') -> 3 decimals
+      - Percent/ratio-ish fields (anywhere, including snapshots):
+          * keys containing one of: 'pct', 'percent', 'ratio', 'bb_width'
+          * -> 4 decimals (kept as fraction, not percentage string)
+      - Feature snapshots like 'rsi@entry', 'adx@entry', 'bb_width@entry', 'atr_pips@entry':
+          * if key contains 'atr_pips' -> int (pips)
+          * else -> 2 decimals (unless ratio rule above triggers -> 4 decimals)
+      - 'seconds_median' -> int, 'days_median' -> 2 decimals
+      - Monte Carlo fields (p05, p50, p95, exp, mdd05, p??_mdd) -> int (pips)
+      - Default numeric fallback -> 3 decimals
+      - Leave timestamps/strings/None untouched
+    """
+    import math
+    import pandas as pd
+
+    # Coerce key to string for pattern tests (handles numeric quantile keys)
+    k = str(key)
+
+    if val is None:
+        return None
+    if isinstance(val, (str, pd.Timestamp, pd.Timedelta)):
+        return val
+
+    # --- Helpers
+
+    def _is_ratio_key(s: str) -> bool:
+        s = s.lower()
+        return any(tag in s for tag in ("pct", "percent", "ratio", "bb_width"))
+
+    # If not numeric, return as-is
+    if not _is_number(val):
+        return val
+
+    f = float(val)
+
+    # pips anywhere
+    if "pips" in k:
+        return int(round(f))
+
+    # Treat these risk fields as pips too -> int
+    if k in {"avg_win","avg_loss","max_win","max_loss"}:
+        return int(round(float(val)))
+
+    # rates/coverage
+    if k in {"win_rate", "prob_neg_total"}:
+        return round(float(val), 3)
+
+    if k.endswith("coverage"):
+        return round(f, 3)
+
+    # holding period
+    if k == "seconds_median":
+        return int(round(f))
+    if k == "days_median":
+        f = float(val)
+        return int(f) if f.is_integer() else round(f, 2)
+
+    # monte carlo pips-like keys
+    if k in {"p05","p50","p95","exp","mdd05","p05_mdd","p50_mdd","p95_mdd"}:
+        return int(round(f))
+
+    # feature snapshots
+    if "@entry" in k or "@exit" in k:
+        if "atr_pips" in k:
+            return int(round(f))
+        # If snapshot is ratio-like (e.g., bb_width@entry), use 4dp
+        if _is_ratio_key(k):
+            return round(f, 4)
+        # Otherwise default 2dp for snapshot values
+        return round(f, 2)
+
+    # general ratio-like keys anywhere else
+    if _is_ratio_key(k):
+        return round(f, 4)
+
+    # default numeric fallback
+    return round(f, 3)
+
+
+def _round_structure_for_brief(obj):
+    """Walk the brief (dict/list/scalars) and apply _round_value_for_brief by key."""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if isinstance(v, (dict, list)):
+                out[k] = _round_structure_for_brief(v)
+            else:
+                out[k] = _round_value_for_brief(k, v)
+        return out
+    elif isinstance(obj, list):
+        return [_round_structure_for_brief(x) for x in obj]
+    else:
+        return obj
+
+
+def build_pips_brief(payload: StrategyRunPayload) -> Dict[str, Any]:
+    """
+    Create a compact, JSON-ready brief for LLM/ML consumption. Pips-only.
+    """
+    validate_trades(payload.trades)
+    t = payload.trades.copy()
+    # Ensure chronological order for DD/cumulative
+    if "entry_time" in t.columns:
+        t = t.sort_values("entry_time")
+
+    # Normalize side for consistent downstream reads (does not mutate caller df)
+    t["side_norm"] = normalize_side(t["side"])
+    counts_by_side = t["side_norm"].value_counts(dropna=False).to_dict()
+
+    overall = {
+        "n_trades": int(len(t)),
+        "mean_pips": float(t["pips"].mean()) if len(t) else 0.0,
+        "median_pips": float(t["pips"].median()) if len(t) else 0.0,
+        "total_pips": float(t["pips"].sum()),
+        "by_side_total_pips": {
+            "long": float(t.loc[t["side_norm"] == "long", "pips"].sum()) if len(t) else 0.0,
+            "short": float(t.loc[t["side_norm"] == "short", "pips"].sum()) if len(t) else 0.0,
+        },
+    }
+
+    # Include any indicator snapshot columns that happen to be present
+    snapshot_cols = (
+        [c for c in OPTIONAL_TRADE_COLS if c in t.columns]
+        if OPTIONAL_TRADE_COLS
+        else [c for c in t.columns if c.endswith("@entry") or c.endswith("@exit")]
+    )
+
+    # Keep small sample for token control
+    base_cols = ["entry_time", "exit_time", "side", "pips"]
+    base_cols = [c for c in base_cols if c in t.columns]
+    sample_cols = base_cols + snapshot_cols
+    samples = t[sample_cols].head(25) if sample_cols else pd.DataFrame()
+
+    # SAFETY: bind 'brief' before any later mutations
+    brief: Dict[str, Any] = {}
+    # Build the core block in small, safe steps so a failure doesn't leave 'brief' unbound
+    meta_dict = asdict(payload.meta)
+    # (Optional) harden meta types (in case future callers pass a Timestamp again)
+    ts_val = meta_dict.get("timestamp")
+    if isinstance(ts_val, pd.Timestamp):
+        meta_dict["timestamp"] = ts_val.isoformat()
+        
+    brief.update({
+        "meta": meta_dict,
+        "params": payload.params,
+        "overall_pips": overall,
+        "columns_present": list(t.columns),
+        "pips_quantiles": t["pips"].quantile([.1,.25,.5,.75,.9]).round(2).to_dict() if len(t) else {},
+        "samples": samples.to_dict(orient="records") if not samples.empty else [],
+    })
+    
+    brief["counts"] = {
+        "n_long": int(counts_by_side.get("long", 0)),
+        "n_short": int(counts_by_side.get("short", 0)),
+    }
+    # ⬇️ Add the risk snapshot here
+    brief["risk_snapshot"] = _risk_snapshot(t)
+    brief["by_year"] = _by_year_rollups(t)
+    brief["holding_period"] = _holding_period(t)
+    brief["max_dd_pips"] = _max_dd_over_trades(t)
+
+    # If payload contains bt_config, surface it; otherwise default zeros
+    costs = {"fee_bps": 0.0, "slippage_bps": 0.0, "applied": False}
+    if hasattr(payload, "bt_config") and payload.bt_config is not None:
+        cfg = payload.bt_config
+        costs = {
+            "fee_bps": float(getattr(cfg, "fee_bps", 0.0)),
+            "slippage_bps": float(getattr(cfg, "slippage_bps", 0.0)),
+            "applied": True
+        }
+    brief["costs"] = costs
+
+    # From trades (always available if you have trades)
+    start_ts = pd.to_datetime(t["entry_time"], utc=True, errors="coerce").min() if "entry_time" in t.columns else None
+    end_ts   = pd.to_datetime(t["exit_time"],  utc=True, errors="coerce").max() if "exit_time"  in t.columns else None
+    brief["data_window"] = {
+        "from": None if pd.isna(start_ts) else (start_ts.isoformat() if start_ts is not None else None),
+        "to":   None if pd.isna(end_ts)   else (end_ts.isoformat() if end_ts   is not None else None),
+    }
+    # If you have payload.bar_index (price index), you can optionally add bars
+    if payload.bar_index is not None and len(payload.bar_index) > 0:
+        brief["data_window"]["bars"] = int(len(payload.bar_index))
+
+    if getattr(payload, "feature_cols", None):
+        brief["feature_coverage"] = _feature_coverage(payload.trades, payload.feature_cols)
+
+    # Monte Carlo (safe, optional)
+    try:
+        if "pips" in t.columns and len(t):
+            brief["monte_carlo"] = monte_carlo_summary(
+                t["pips"],
+                iters=5000,         # tweak if you like
+                horizon=None,       # None => use len(pips)
+                seed=42
+            )
+        else:
+            brief["monte_carlo"] = {
+                "p05": 0.0, "p50": 0.0, "p95": 0.0, "exp": 0.0, "mdd05": 0.0,
+                "p05_mdd": 0.0, "p50_mdd": 0.0, "p95_mdd": 0.0,
+                "prob_neg_total": 0.0, "n_sims": 0, "horizon": 0
+            }
+    except Exception:
+        # Keep the brief robust even if MC fails
+        pass
+
+    # Optional: include a tiny spark of the cumulative curve if bar_index is given
+    if payload.bar_index is not None and len(payload.bar_index) > 0:
+        try:
+            cum = cumulative_pips(t, payload.bar_index, when="exit")
+            # compress: take ~50 evenly spaced points to control tokens
+            if len(cum) > 50:
+                idx = (pd.Series(range(len(cum))) * (len(cum) - 1) / 49).round().astype(int).unique()
+                cum_small = cum.iloc[idx].rename_axis("time").reset_index()
+            else:
+                cum_small = cum.rename_axis("time").reset_index()
+            brief["cumulative_pips_preview"] = [
+                {"time": str(row["time"]), "cum_pips": float(row[0])} for _, row in cum_small.iterrows()
+            ]
+        except Exception:
+            # Don't fail the brief if cumulative calculation can't be constructed
+            pass
+
+    # Optional non-fatal diagnostics
+    notes = []
+    try:
+        # If no longs/shorts, hint
+        if brief.get("counts", {}).get("n_long", 0) == 0:
+            notes.append("No long trades recorded. Upstream filters or entry logic may be suppressing longs.")
+        if brief.get("counts", {}).get("n_short", 0) == 0:
+            notes.append("No short trades recorded. Upstream filters or entry logic may be suppressing shorts.")
+        try:
+            if not brief.get("costs", {}).get("applied", False):
+                notes.append("Trading costs are NOT applied in these results.")
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    if notes:
+        brief["notes"] = sorted(set(notes))
+    
+    try:
+        rs = getattr(payload, "regime_series", None)
+        if rs is not None and not rs.empty and "entry_time" in t.columns and "pips" in t.columns:
+            # choose regime: user-provided takes priority
+            active = getattr(payload, "active_regime", None)
+            selection = "provided"
+            if active is None:
+                # auto-pick regime with highest total pips (align label at entry_time)
+                et = pd.to_datetime(t["entry_time"], utc=True, errors="coerce")
+                labs = rs.reindex(et, method="ffill")
+                by_reg = t.groupby(labs)["pips"].sum().dropna()
+                if len(by_reg):
+                    active = int(by_reg.idxmax())
+                    selection = "auto"
+
+            if active is not None:
+                brief["regime_filter_eval"] = evaluate_regime_filter(
+                    trades=t,
+                    regime_series=rs,
+                    active_regime=active,
+                    regimes_meta=getattr(payload, "regimes_meta", None),
+                )
+                brief["regime_filter_eval"]["selection"] = selection
+                brief["regime_filter_eval"]["active_regime"] = int(active)
+    except Exception:
+        pass
+    
+    # Snap by_side_total_pips to int pips as a display convention
+    if "overall_pips" in brief and isinstance(brief["overall_pips"], dict):
+        bs = brief["overall_pips"].get("by_side_total_pips")
+        if isinstance(bs, dict):
+            bs_fixed = {}
+            for side, v in bs.items():
+                if _is_number(v):
+                    bs_fixed[side] = int(round(float(v)))
+                else:
+                    bs_fixed[side] = v
+            brief["overall_pips"]["by_side_total_pips"] = bs_fixed
+    
+    brief_rounded = _round_structure_for_brief(brief)
+    brief_coerced = _coerce_tree(brief_rounded)  # <-- must be here, after rounding
+    return _jsonify(brief_coerced)
+
+
+
+
+
+def annotate_trades(
+    trades: pd.DataFrame,
+    data: pd.DataFrame,
+    *,
+    symbol: str | None = None,
+    pip: float | None = None,
+    price_col: str = "close",
+    feature_cols: tuple[str, ...] | list[str] | None = ("rsi", "adx", "atr", "bb_width"),
+    at: str = "entry",            # "entry" or "exit" for feature snapshot timing
+    strict_features: bool = True, # if True and none of requested features exist -> raise
+) -> pd.DataFrame:
+    """
+    Add MFE/MAE (in pips) and snapshot selected features at a chosen moment ('entry' or 'exit').
+
+    Requires 'trades' columns: entry_time, exit_time, entry_price, side
+    Requires 'data' to be datetime-indexed with `price_col` and any requested features.
+
+    - MFE (max favorable excursion) and MAE (max adverse excursion) are computed side-aware
+      over the inclusive window [entry_time, exit_time], in pips.
+    - Features are snapped using a time-aware backward join (no look-ahead):
+      the latest known feature values at or before the timestamp specified by `at`.
+
+    Returns the original trades with added columns:
+      - 'mfe_pips', 'mae_pips'
+      - '<feature>@<at>' for each feature in `feature_cols` that exists in `data`
+    """
+    required = {"entry_time", "exit_time", "entry_price", "side"}
+    missing = required - set(trades.columns)
+    if missing:
+        raise ValueError(f"trades is missing required columns: {sorted(missing)}")
+
+    # --- normalize times and data index
+    out = trades.copy()
+    out["entry_time"] = pd.to_datetime(out["entry_time"], errors="coerce")
+    out["exit_time"]  = pd.to_datetime(out["exit_time"],  errors="coerce")
+
+    d = data.copy()
+    if not isinstance(d.index, pd.DatetimeIndex):
+        d.index = pd.to_datetime(d.index, errors="coerce")
+    d = d.sort_index()
+
+    # --- MFE/MAE in pips (side-aware)
+    if pip is None:
+        pip = infer_pip_size(symbol) if symbol is not None else 0.0001
+    pip = float(pip)
+    if pip == 0.0:
+        raise ValueError("pip must be non-zero")
+
+    if price_col not in d.columns:
+        raise KeyError(f"'{price_col}' not found in data columns: {list(d.columns)[:10]} ...")
+
+    px = pd.to_numeric(d[price_col], errors="coerce")
+    side_series = normalize_side(out["side"])
+
+    mfe, mae = [], []
+    for i, r in out.iterrows():
+        t0, t1 = r["entry_time"], r["exit_time"]
+        ep = pd.to_numeric(r["entry_price"], errors="coerce")
+        if pd.isna(t0) or pd.isna(t1) or pd.isna(ep):
+            mfe.append(np.nan); mae.append(np.nan); continue
+
+        w = px.loc[(px.index >= t0) & (px.index <= t1)]
+        if w.empty:
+            mfe.append(np.nan); mae.append(np.nan); continue
+
+        sgn = 1.0 if (str(side_series.loc[i]) == "long") else -1.0
+        signed = (w.values - float(ep)) / pip * sgn
+        mfe.append(float(np.nanmax(signed)))
+        mae.append(float(np.nanmin(signed)))
+
+    out["mfe_pips"] = mfe
+    out["mae_pips"] = mae
+
+    # --- Feature snapshot at `at` ("entry" or "exit"), backward (no look-ahead)
+    if feature_cols:
+        if at not in ("entry", "exit"):
+            raise ValueError("`at` must be 'entry' or 'exit'")
+        feats_present = [c for c in feature_cols if c in d.columns]
+        if not feats_present:
+            if strict_features:
+                raise ValueError(
+                    f"No requested features found. Requested={list(feature_cols)} "
+                    f"Available sample={list(d.columns[:10])}"
+                )
+            # else: just return with MFE/MAE only
+            return out
+
+        ts_col = f"{at}_time"
+        left = out[[ts_col]].copy()
+        left[ts_col] = pd.to_datetime(left[ts_col], errors="coerce")
+        left = left.reset_index(drop=False).sort_values(ts_col)
+
+        right = d[feats_present].reset_index()
+        right.columns = [ts_col] + feats_present
+        right = right.sort_values(ts_col)
+
+        merged = pd.merge_asof(
+            left, right, on=ts_col, direction="backward", allow_exact_matches=True
+        ).sort_values("index")
+
+        snapped = merged[feats_present].add_suffix(f"@{at}").reset_index(drop=True)
+        out = out.reset_index(drop=True).join(snapped)
+
+    return out
+
+def _by_year_rollups(trades: pd.DataFrame) -> list[dict]:
+    t = trades.copy()
+    if "entry_time" not in t.columns:
+        return []
+    t["entry_time"] = pd.to_datetime(t["entry_time"], utc=True, errors="coerce")
+    grp = t.dropna(subset=["entry_time"]).groupby(t["entry_time"].dt.year, dropna=True)
+    out = []
+    for y, g in grp:
+        out.append({
+            "year": int(y),
+            "n_trades": int(len(g)),
+            "total_pips": float(g["pips"].sum()),
+            "mean_pips": float(g["pips"].mean()) if len(g) else 0.0,
+            "median_pips": float(g["pips"].median()) if len(g) else 0.0,
+        })
+    return out
+
+def _holding_period(trades: pd.DataFrame) -> dict:
+    t = trades.copy()
+    out = {}
+    # bars if present
+    if "entry_index" in t.columns and "exit_index" in t.columns:
+        bars = (t["exit_index"] - t["entry_index"]).astype("Int64")
+        bars = bars.dropna()
+        if len(bars):
+            out["bars_median"] = int(bars.median())
+            out["bars_mean"] = float(bars.mean())
+    # time if present
+    if "entry_time" in t.columns and "exit_time" in t.columns:
+        et = pd.to_datetime(t["entry_time"], utc=True, errors="coerce")
+        xt = pd.to_datetime(t["exit_time"],  utc=True, errors="coerce")
+        hp = (xt - et).dropna()
+        if len(hp):
+            out["seconds_median"] = float(hp.dt.total_seconds().median())
+            out["days_median"] = float((hp.dt.total_seconds() / 86400).median())
+    return out
+
+def _max_dd_over_trades(trades: pd.DataFrame) -> float:
+    # order as recorded; if you prefer chronological, sort by entry_time first
+    cp = trades["pips"].astype(float).cumsum()
+    dd = cp - cp.cummax()
+    return float(dd.min()) if len(dd) else 0.0
+
+def _feature_coverage(df: pd.DataFrame, feature_cols: list[str]) -> list[dict]:
+    out = []
+    feats = [c for c in feature_cols if c in df.columns]
+    for c in feats:
+        s = df[c]
+        out.append({
+            "feature": c,
+            "present": int(s.notna().sum()),
+            "missing": int(s.isna().sum()),
+            "coverage": float(s.notna().mean()),
+        })
+    return out
+
+def _is_number(x):
+    try:
+        return math.isfinite(float(x))
+    except Exception:
+        return False
+
+# Fields that should be ints if numeric
+_INT_KEYS_EXACT = {
+    "n_trades", "seconds_median", "bars", "year",
+    "n_sims", "horizon", "n_long", "n_short",
+    "total_pips", "max_dd_pips", "mdd05",
+}
+
+def _coerce_scalar_type(key: str, val, *, in_params: bool, parent_key: str | None):
+    k = str(key)
+
+    # Leave None/strings/timestamps alone
+    if val is None or isinstance(val, (str, pd.Timestamp, pd.Timedelta)):
+        return val
+
+    # Keep real bools as-is
+    if isinstance(val, bool):
+        return val
+
+    # Restore applied -> bool if it drifted to 0/1
+    if k == "applied" and _is_number(val):
+        return bool(int(round(float(val))))
+
+    # Inside params: any integral numeric -> int (e.g., fast/slow/atr_length)
+    if in_params and _is_number(val):
+        f = float(val)
+        return int(f) if f.is_integer() else f
+
+    # tuning.top rows use "param_*" keys — snap integral numerics to int
+    if k.startswith("param_") and _is_number(val):
+        f = float(val)
+        return int(f) if f.is_integer() else f
+    
+    # Side totals: force ints (you want whole pips)
+    if parent_key == "by_side_total_pips" and _is_number(val):
+        return int(round(float(val)))
+
+    # Risk snapshot pip metrics -> whole pips
+    if k in {"avg_win", "avg_loss", "max_win", "max_loss"} and _is_number(val):
+        return int(round(float(val)))
+
+    # Known int keys elsewhere
+    if k in _INT_KEYS_EXACT and _is_number(val):
+        return int(round(float(val)))
+
+    return val
+
+def _coerce_tree(obj, *, in_params: bool = False, parent_key: str | None = None):
+    if isinstance(obj, dict):
+        out = {}
+        # entering params?
+        child_in_params = in_params or (parent_key == "params")
+        for k, v in obj.items():
+            if isinstance(v, (dict, list)):
+                out[k] = _coerce_tree(v, in_params=child_in_params, parent_key=k)
+            else:
+                out[k] = _coerce_scalar_type(k, v, in_params=child_in_params, parent_key=parent_key)
+        return out
+    elif isinstance(obj, list):
+        return [_coerce_tree(v, in_params=in_params, parent_key=parent_key) for v in obj]
+    else:
+        # leaf without key context (rare)
+        return _coerce_scalar_type("", obj, in_params=in_params, parent_key=parent_key)

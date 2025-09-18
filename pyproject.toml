@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyfx_utils"
+version = "0.0.3"
+description = "FX research utilities"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.23",
+  "pandas>=2.1",
+  "ta>=0.11"
+]
+
+[project.optional-dependencies]
+analysis = [
+  "statsmodels>=0.14",
+  "scikit-learn>=1.2",
+]
+viz = [
+  "matplotlib>=3.7",
+  "plotly>=5.15",
+  "lightweight-charts>=0.8",  # import as 'lightweight_charts'
+  "ipywidgets>=8.0",
+]
+dev = [
+  "pytest>=8.0",
+  "hypothesis>=6.0",
+]
+# one-shot "all" bundle (cannot reference self; list the deps explicitly)
+all = [
+  "statsmodels>=0.14",
+  "scikit-learn>=1.2",
+  "matplotlib>=3.7",
+  "plotly>=5.15",
+  "lightweight-charts>=0.8",
+  "ipywidgets>=8.0",
+  "pytest>=8.0",
+  "hypothesis>=6.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pyfx_utils*"]
+exclude = ["tests*", "docs*"]
